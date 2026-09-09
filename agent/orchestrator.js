@@ -72,7 +72,15 @@ export function createScreeningAgent({ useModel = Boolean(process.env.OPENAI_API
           modelStatus = `grounded-summary-unavailable: ${error.message}`
         }
       }
-      return { ...result, narrative, modelStatus }
+      // Do not return the input candidate/requisition or the full recomputed
+      // assessment. Persisting those inside candidate.agentReview recursively
+      // nests the application on every rerun and can exhaust localStorage.
+      return {
+        recommendation: result.recommendation,
+        trace: result.trace,
+        narrative,
+        modelStatus,
+      }
     },
   }
 }

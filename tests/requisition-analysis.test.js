@@ -28,3 +28,17 @@ test('multi-region assessment accepts scale above 10k rather than only the liter
   const result = screenCandidate(candidate, defaultRequisition)
   assert.equal(result.assessments.find((item) => item.criterionId === 'multiregion').level, 'strong')
 })
+
+test('plain-language total experience claims are evaluated against the experience floor', () => {
+  const requisition = { ...defaultRequisition, constraints: { minExperienceYears: 5, maxSalaryLpa: null, seniority: 'mid' } }
+  const candidate = screenCandidate({ id: 'years', name: 'Years Test', text: 'SUMMARY\n6 years of professional experience building Java services.\nEDUCATION\nB.Tech 2014 - 2018' }, requisition)
+  const analysis = analyzeRequisition([candidate], requisition)
+  assert.equal(analysis.requirementCoverage.find((item) => item.id === 'experience').met, 1)
+})
+
+test('role headers with an em-dash duration remain valid experience evidence', () => {
+  const requisition = { ...defaultRequisition, constraints: { minExperienceYears: 4, maxSalaryLpa: null, seniority: 'mid' } }
+  const candidate = screenCandidate({ id: 'header-years', name: 'Header Years', text: 'Header Years\nPlatform Engineer — 4 years\nEXPERIENCE\nBuilt and operated Java services.' }, requisition)
+  const analysis = analyzeRequisition([candidate], requisition)
+  assert.equal(analysis.requirementCoverage.find((item) => item.id === 'experience').met, 1)
+})

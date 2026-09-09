@@ -1,8 +1,14 @@
 const meetsLevel = (level) => ['strong', 'supported'].includes(level)
 
 function documentedYears(candidate) {
-  const match = candidate.text.match(/(?:—|-)\s*(\d+(?:\.\d+)?)\s+years?(?:\s+experience)?/i)
-  return match ? Number(match[1]) : null
+  const lines = candidate.text.split('\n').map((line) => line.trim()).filter(Boolean)
+  const claims = lines.flatMap((line) => {
+    if (/\b(education|degree|b\.?tech|university|college)\b/i.test(line)) return []
+    const explicitExperience = [...line.matchAll(/\b(\d+(?:\.\d+)?)\+?\s+years?(?:\s+of)?\s+(?:professional\s+|industry\s+|software\s+|platform\s+)?experience\b/ig)].map((match) => Number(match[1]))
+    const roleHeader = [...line.matchAll(/(?:—|-)\s*(\d+(?:\.\d+)?)\+?\s+years?\b/ig)].map((match) => Number(match[1]))
+    return [...explicitExperience, ...roleHeader]
+  })
+  return claims.length ? Math.max(...claims) : null
 }
 
 function constraintEvaluation(candidate, constraints) {

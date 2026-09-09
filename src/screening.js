@@ -110,6 +110,48 @@ function assessCriterion(text, criterion) {
 
 const levelValue = { strong: 4, supported: 3, partial: 2, emerging: 1, 'claim-only': 1, conflicting: 0, 'not-addressed': 0 }
 
+// Cross-check step: a verified GitHub repo (or an authorized LinkedIn export)
+// touching the same skill area is real, independent evidence — but a repo
+// existing is weaker proof than a demonstrated, production-context resume
+// bullet, so it can only nudge a criterion up one step and never past
+// "supported" on its own, and it never overrides a contradiction.
+const corroborationLadder = ['not-addressed', 'claim-only', 'emerging', 'partial', 'supported', 'strong']
+const corroborationCeiling = corroborationLadder.indexOf('supported')
+
+function externalSignalsByCriterion(verification) {
+  const signals = [...(verification?.github?.criteriaSignals || []), ...(verification?.linkedin?.criteriaSignals || [])]
+  const byCriterion = new Map()
+  for (const signal of signals) {
+    if (!byCriterion.has(signal.criterionId)) byCriterion.set(signal.criterionId, [])
+    byCriterion.get(signal.criterionId).push(signal)
+  }
+  return byCriterion
+}
+
+function applyExternalCorroboration(assessments, verification) {
+  const signalsByCriterion = externalSignalsByCriterion(verification)
+  if (!signalsByCriterion.size) return assessments
+  return assessments.map((assessment) => {
+    const signals = signalsByCriterion.get(assessment.criterionId)
+    if (!signals?.length || assessment.level === 'conflicting') return assessment
+    const currentIndex = corroborationLadder.indexOf(assessment.level)
+    const level = currentIndex >= 0 && currentIndex < corroborationCeiling ? corroborationLadder[currentIndex + 1] : assessment.level
+    const confidence = Math.max(assessment.confidence, Math.min(80, assessment.confidence + 10))
+    const repos = [...new Set(signals.filter((s) => s.repo).map((s) => s.repo))]
+    const linkedinOnly = signals.every((s) => s.source === 'LinkedIn')
+    const note = repos.length
+      ? `Cross-checked: GitHub repositor${repos.length === 1 ? 'y' : 'ies'} (${repos.join(', ')}) reference${repos.length === 1 ? 's' : ''} this area.`
+      : linkedinOnly ? 'Cross-checked: the authorized LinkedIn export references this area.' : 'Cross-checked against external evidence for this area.'
+    return {
+      ...assessment,
+      level,
+      confidence,
+      externalCorroboration: signals.map(({ source, repo, repoUrl, terms }) => ({ source, repo, repoUrl, terms })),
+      reason: `${assessment.reason} ${note}`,
+    }
+  })
+}
+
 function getTradeoffs(assessments, requisition) {
   const strong = assessments.filter((a) => ['strong', 'supported'].includes(a.level))
     .map((a) => requisition.criteria.find((c) => c.id === a.criterionId)?.name)
@@ -123,19 +165,20 @@ function getTradeoffs(assessments, requisition) {
 
 export function screenCandidate(candidate, requisition) {
   const flags = detectContradictions(candidate.text, requisition)
-  const assessments = requisition.criteria.map((criterion) => {
+  const resumeAssessments = requisition.criteria.map((criterion) => {
     const assessment = assessCriterion(candidate.text, criterion)
     const relevantFlags = flags.filter((flag) => flag.criteriaIds.includes(criterion.id))
-    if (!relevantFlags.length) return { ...assessment, flags: [], originalConfidence: assessment.confidence }
+    if (!relevantFlags.length) return { ...assessment, criterionType: criterion.type, flags: [], originalConfidence: assessment.confidence }
     const conflict = relevantFlags.some((flag) => flag.kind === 'contradictory')
     return {
-      ...assessment, flags: relevantFlags, originalConfidence: assessment.confidence,
+      ...assessment, criterionType: criterion.type, flags: relevantFlags, originalConfidence: assessment.confidence,
       confidence: Math.max(0, Math.min(assessment.confidence - 15, ...relevantFlags.map((flag) => flag.confidenceCap))),
       level: conflict ? 'conflicting' : assessment.level === 'strong' ? 'supported' : assessment.level,
       hasUnsupportedClaim: true,
       reason: conflict ? 'Conflicting source passages leave this criterion unresolved. Review the cited claims before relying on it.' : `${assessment.reason} The flagged claim remains unverified; confidence is reduced.`,
     }
   })
+  const assessments = applyExternalCorroboration(resumeAssessments, candidate.verification)
   const required = assessments.filter((a) => requisition.criteria.find((c) => c.id === a.criterionId)?.type === 'required')
   const requiredStrong = required.filter((a) => ['strong', 'supported'].includes(a.level)).length
   const requiredPartial = required.filter((a) => ['partial', 'emerging'].includes(a.level)).length
@@ -165,7 +208,7 @@ export function screenCandidate(candidate, requisition) {
     requiredStrong,
     requiredTotal: required.length,
     unsupportedCount: unsupportedClaims.length,
-    evidenceCoverage: Math.round((evidencePoints / maxPoints) * 100),
+    evidenceCoverage: maxPoints ? Math.round((evidencePoints / maxPoints) * 100) : 0,
     confidence,
     band,
     ...getTradeoffs(assessments, requisition),

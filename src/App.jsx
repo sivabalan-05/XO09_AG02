@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import * as XLSX from 'xlsx'
 import {
   AlertCircle, ArrowLeft, ArrowRight, BarChart3, Check, CheckCircle2, ChevronDown,
   CircleHelp, CloudUpload, FileText, Filter, LayoutDashboard, Menu, Pencil, Plus,
@@ -8,8 +7,9 @@ import {
 } from 'lucide-react'
 import { defaultRequisition, sampleCandidates } from './data'
 import { getPoolInsights, levelLabels, screenPool } from './screening'
-import { runBrowserLangChain } from './browserAgent'
 import { analyzeRequisition } from './requisitionAnalysis'
+import { downloadScreeningWorkbook } from './reportExport'
+import { verifyGitHubProfile, verifyLinkedInEvidence, extractGithubUrl, extractLinkedInUrl, searchGitHubProfiles } from '../agent/verifiers.js'
 
 const views = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
@@ -21,7 +21,7 @@ const views = [
 function Avatar({ name, size = 'md' }) {
   const colors = ['moss', 'clay', 'navy', 'plum', 'ochre']
   const index = name.split('').reduce((sum, c) => sum + c.charCodeAt(0), 0) % colors.length
-  return <span className={`avatar ${colors[index]} ${size}`}>{name.split(' ').map((p) => p[0]).join('').slice(0, 2)}</span>
+  return <span className={`avatar ${colors[index]} ${size}`}>{name.split(' ').filter(Boolean).map((p) => p[0]).join('').slice(0, 2)}</span>
 }
 
 function LevelPill({ level, compact = false }) {
@@ -29,7 +29,7 @@ function LevelPill({ level, compact = false }) {
 }
 
 const STORAGE = { candidates: 'verity:candidates:v2', requisition: 'verity:requisition:v2' }
-const AGENT_API = import.meta.env.VITE_AGENT_API_URL || 'http://127.0.0.1:8787'
+const AGENT_API = import.meta.env.VITE_AGENT_API_URL || ''
 function readStored(key, fallback) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback } catch { return fallback }
 }
@@ -112,7 +112,7 @@ function RequisitionHeader({ requisition, screened, onEdit, onFilter }) {
 }
 
 function CandidateRow({ candidate, rank, onOpen, selected, onSelect }) {
-  const required = candidate.assessments.filter((a) => a.criterionId !== 'iac' && a.criterionId !== 'collaboration')
+  const required = candidate.assessments.filter((assessment) => assessment.criterionType === 'required')
   return (
     <div className="candidate-row">
       <button className="candidate-main" onClick={() => onOpen(candidate)} aria-label={`Open evidence assessment for ${candidate.name}`}>
@@ -138,7 +138,7 @@ function PoolGap({ insight, poolSize }) {
   return (
     <div className="gap-banner">
       <span className="gap-icon"><AlertCircle size={20} /></span>
-      <div><span className="overline">POOL-WIDE GAP</span><h3>{insight.name}</h3><p>No applicant fully demonstrates the required ownership and scale. Consider reframing this as preferred, expanding the level, or planning to develop it after hire.</p></div>
+      <div><span className="overline">POOL-WIDE GAP</span><h3>{insight.name}</h3><p>No applicant has supported evidence for this required criterion. Consider reframing it as preferred, expanding the role level, or planning to develop it after hire.</p></div>
       <span className="gap-count">0/{poolSize}<small>fully meet</small></span>
     </div>
   )
@@ -153,7 +153,7 @@ function Overview({ screened, insights, onOpen, onNavigate, onFilter, selected, 
       <div className="section-heading"><div><span className="overline">SCREENING COMPLETE</span><h2>Evidence, not adjectives.</h2><p>The shortlist prioritizes demonstrated work while keeping each candidate’s trade-offs visible.</p></div><span className="audit-badge"><CheckCircle2 size={16} /> {screened.length} applications analyzed</span></div>
       <section className="metric-grid" aria-label="Screening summary actions">
         <button className="metric-block" onClick={() => onFilter('leading')}><span>Leading candidates</span><strong>{strongCount}</strong><p>View candidates with strong evidence</p></button>
-        <button className="metric-block" onClick={() => onNavigate('insights')}><span>Evidence coverage</span><strong>{Math.round(screened.reduce((s, c) => s + c.evidenceCoverage, 0) / screened.length)}%</strong><p>View evidence across all criteria</p></button>
+        <button className="metric-block" onClick={() => onNavigate('insights')}><span>Evidence coverage</span><strong>{screened.length ? Math.round(screened.reduce((s, c) => s + c.evidenceCoverage, 0) / screened.length) : 0}%</strong><p>View evidence across all criteria</p></button>
         <button className="metric-block warning" onClick={() => onFilter('flagged')}><span>Claims to validate</span><strong>{screened.reduce((n, c) => n + c.flags.length, 0)}</strong><p>Open applications requiring review</p></button>
         <button className="metric-block critical" onClick={() => onNavigate('insights')}><span>Pool-wide gaps</span><strong>{insights.filter((i) => i.isGap).length}</strong><p>Review unmet required criteria</p></button>
       </section>
@@ -194,13 +194,13 @@ function Candidates({ screened, onOpen, selected, onSelect, filterMode, clearFil
   )
 }
 
-function Insights({ insights, screened, requisition, requisitionAnalysis }) {
+function Insights({ insights, screened, requisition, requisitionAnalysis, onOpen }) {
   return (
     <div className="page-content">
       <div className="section-heading"><div><span className="overline">REQUISITION HEALTH</span><h2>What this applicant pool can actually support</h2><p>Coverage is based on concrete evidence—not the frequency of matching keywords.</p></div></div>
       <section className={`no-full-match ${requisitionAnalysis.noFullMatch ? 'active' : ''}`}><ShieldAlert size={22} /><div><span className="overline">SHORTLISTING SAFEGUARD</span><h3>{requisitionAnalysis.noFullMatch ? 'No candidate fully satisfies all required criteria.' : `${requisitionAnalysis.fullMatches.length} candidate${requisitionAnalysis.fullMatches.length === 1 ? '' : 's'} fully satisfy all required criteria.`}</h3><p>{requisitionAnalysis.noFullMatch ? 'The shortlist below shows the closest candidates and the exact weaknesses that still need a recruiter decision.' : 'Trade-offs remain visible for every candidate.'}</p></div></section>
       <section className="panel requisition-analysis"><div className="panel-heading"><div><span className="overline">SURPRISE CHALLENGE 02</span><h3>Requirement conflict & pool feasibility</h3><p>Checks for incompatible or highly restrictive requirements before shortlisting.</p></div></div><div className="conflict-list">{requisitionAnalysis.conflicts.length ? requisitionAnalysis.conflicts.map((conflict) => <article className={conflict.severity} key={conflict.id}><AlertCircle size={17} /><div><strong>{conflict.title}</strong><p>{conflict.detail}</p></div></article>) : <article className="clear"><CheckCircle2 size={17} /><div><strong>No structural conflict detected</strong><p>Current requirements do not trigger a rule-based requisition conflict. Pool coverage is still shown below.</p></div></article>}</div><div className="requirement-coverage">{requisitionAnalysis.requirementCoverage.map((item) => <div key={item.id}><span>{item.type === 'constraint' ? 'CONSTRAINT' : 'REQUIRED'}</span><strong>{item.name}</strong><p><b>{item.met}</b> of {item.total} candidates have supported evidence / meet this constraint</p><i><em style={{ width: `${item.coverage}%` }} /></i></div>)}</div></section>
-      <section className="panel tradeoff-shortlist"><div className="panel-heading"><div><h3>Closest-fit shortlist</h3><p>Ordered by required areas met; weaknesses are intentionally not hidden in a composite score.</p></div></div><div className="conflict-shortlist">{requisitionAnalysis.shortlist.map((item) => <article key={item.candidate.id}><Avatar name={item.candidate.name} /><div><h4>{item.candidate.name}</h4><p><CheckCircle2 size={13} /> <strong>Strengths:</strong> {item.strengths.join(', ') || 'No required area strongly evidenced'}</p><p className="shortlist-trade"><AlertCircle size={13} /> <strong>Trade-offs:</strong> {item.tradeoffs.join('; ') || 'No material gap identified'}</p></div><span>{item.matchedRequired}/{requisition.criteria.filter((criterion) => criterion.type === 'required').length}<small>required met</small></span></article>)}</div></section>
+      <section className="panel tradeoff-shortlist"><div className="panel-heading"><div><h3>Closest-fit shortlist</h3><p>Ordered by required areas met; weaknesses are intentionally not hidden in a composite score.</p></div></div><div className="conflict-shortlist">{requisitionAnalysis.shortlist.map((item) => <button key={item.candidate.id} onClick={() => onOpen(item.candidate)} aria-label={`Open evidence assessment for ${item.candidate.name}`}><Avatar name={item.candidate.name} /><div><h4>{item.candidate.name}</h4><p><CheckCircle2 size={13} /> <strong>Strengths:</strong> {item.strengths.join(', ') || 'No required area strongly evidenced'}</p><p className="shortlist-trade"><AlertCircle size={13} /> <strong>Trade-offs:</strong> {item.tradeoffs.join('; ') || 'No material gap identified'}</p></div><span>{item.matchedRequired}/{requisition.criteria.filter((criterion) => criterion.type === 'required').length}<small>required met</small></span></button>)}</div></section>
       {insights.filter((i) => i.isGap).map((insight) => <PoolGap key={insight.id} insight={insight} poolSize={screened.length} />)}
       <section className="panel coverage-panel">
         <div className="panel-heading"><div><h3>Criterion coverage</h3><p>Applicants with supported or strong evidence for each criterion.</p></div><span className="legend"><i className="supported" /> Supported <i className="partial" /> Partial <i className="missing" /> Missing / claim-only</span></div>
@@ -209,7 +209,7 @@ function Insights({ insights, screened, requisition, requisitionAnalysis }) {
           return (
             <div className="coverage-row" key={insight.id}>
               <div className="coverage-label"><span><strong>{insight.name}</strong><small>{insight.type}{insight.stretch ? ' · stretch requirement' : ''}</small></span><b>{insight.coverage}%</b></div>
-              <div className="stacked-bar" aria-label={`${insight.strong} supported, ${insight.partial} partial, ${missing} missing`}><i className="supported" style={{ width: `${insight.strong / screened.length * 100}%` }} /><i className="partial" style={{ width: `${insight.partial / screened.length * 100}%` }} /><i className="missing" style={{ width: `${missing / screened.length * 100}%` }} /></div>
+              <div className="stacked-bar" aria-label={`${insight.strong} supported, ${insight.partial} partial, ${missing} missing`}><i className="supported" style={{ width: `${screened.length ? insight.strong / screened.length * 100 : 0}%` }} /><i className="partial" style={{ width: `${screened.length ? insight.partial / screened.length * 100 : 0}%` }} /><i className="missing" style={{ width: `${screened.length ? missing / screened.length * 100 : 0}%` }} /></div>
               <div className="coverage-counts"><span>{insight.strong} supported</span><span>{insight.partial} partial</span><span>{missing} missing/claim-only</span></div>
             </div>
           )
@@ -258,6 +258,7 @@ function CandidateDetail({ candidate, requisition, onClose, onRemove, onVerify, 
                 <div className="assessment-title"><span><small>{criterion.type}{criterion.stretch ? ' · stretch' : ''}</small><h4>{criterion.name}</h4></span><LevelPill level={assessment.level} /></div>
                 <p className="assessment-reason">{assessment.reason}</p>
                 {assessment.evidence.length ? <div className="evidence-box"><span>Evidence found</span>{assessment.evidence.map((line, i) => <blockquote key={i}>“{line}”</blockquote>)}{assessment.terms.length > 0 && <small>Equivalent terms recognized: {assessment.terms.join(', ')}</small>}</div> : <div className="no-evidence"><AlertCircle size={15} /> No supporting passage found in this application.</div>}
+                {assessment.externalCorroboration?.length > 0 && <div className="external-corroboration"><span><ShieldCheck size={13} /> Cross-checked against external evidence</span>{assessment.externalCorroboration.map((item, i) => <p key={i}>{item.repo ? <a href={item.repoUrl} target="_blank" rel="noreferrer">{item.source} · {item.repo} <ExternalLink size={10} /></a> : item.source} references: {item.terms.join(', ')}</p>)}</div>}
                 <div className="confidence-line"><span>Evidence confidence</span><div><i style={{ width: `${assessment.confidence}%` }} /></div><b>{assessment.confidence}%</b></div>
               </article>
             )
@@ -276,8 +277,10 @@ async function extractFileText(file) {
     pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mjs', import.meta.url).toString()
     const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise
     const pages = []
+    const links = new Set()
     for (let i = 1; i <= pdf.numPages; i++) {
-      const content = await (await pdf.getPage(i)).getTextContent()
+      const page = await pdf.getPage(i)
+      const content = await page.getTextContent()
       // PDF text items are often emitted in drawing order, which can separate a
       // bullet's action from its technology/outcome. Rebuild visual rows first.
       const rows = []
@@ -290,8 +293,14 @@ async function extractFileText(file) {
         row.parts.push({ x, text: item.str })
       }
       pages.push(rows.sort((a, b) => b.y - a.y).map((row) => row.parts.sort((a, b) => a.x - b.x).map((part) => part.text).join(' ')).join('\n'))
+      // An icon-only hyperlink (e.g. a GitHub/LinkedIn glyph with no visible
+      // URL text) carries its target only as a link annotation, not as page
+      // text — pull those in too so evidence and profile matching can see them.
+      for (const annotation of await page.getAnnotations()) {
+        if (annotation.url) links.add(annotation.url)
+      }
     }
-    return pages.join('\n')
+    return pages.join('\n') + (links.size ? `\n\nLINKS\n${[...links].join('\n')}` : '')
   }
   if (extension === 'docx') {
     const mammoth = await import('mammoth/mammoth.browser')
@@ -309,10 +318,30 @@ function UploadModal({ onClose, onAdd, candidateCount }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const fileRef = useRef()
-  const addFiles = (incoming) => setFiles((current) => [...current, ...Array.from(incoming).filter((file) => /\.(pdf|docx|txt|md)$/i.test(file.name))])
+  const detectName = (rawText) => {
+    const lines = rawText.split('\n').map((line) => line.trim()).filter(Boolean)
+    const nameLine = lines.find((line) => /^(?:[A-Z][a-z]{1,30}\s+){1,3}[A-Z][a-z]{1,30}$/.test(line))
+    const firstLine = lines.find((line) => line.length > 2)
+    return nameLine || firstLine?.slice(0, 45)
+  }
+  const addFiles = (incoming) => {
+    const next = Array.from(incoming)
+    const unsupported = next.filter((file) => !/\.(pdf|docx|txt|md)$/i.test(file.name))
+    const oversized = next.filter((file) => file.size > 10 * 1024 * 1024)
+    const accepted = next.filter((file) => /\.(pdf|docx|txt|md)$/i.test(file.name) && file.size <= 10 * 1024 * 1024)
+    if (unsupported.length || oversized.length) {
+      const messages = []
+      if (unsupported.length) messages.push(`${unsupported.length} unsupported file${unsupported.length === 1 ? '' : 's'} skipped`)
+      if (oversized.length) messages.push(`${oversized.length} file${oversized.length === 1 ? '' : 's'} over the 10 MB limit skipped`)
+      setError(messages.join('. ') + '.')
+    } else setError('')
+    setFiles((current) => [...current, ...accepted])
+  }
   const submit = async () => {
     if (!files.length && !text.trim()) { setError('Add at least one resume file or paste application text.'); return }
     if (files.length > 1 && text.trim()) { setError('Attach a cover note with one resume at a time so evidence stays associated with the correct applicant.'); return }
+    if (text.length > 250000) { setError('Pasted application text exceeds the 250,000-character limit.'); return }
+    if (salary !== '' && (!Number.isFinite(Number(salary)) || Number(salary) < 0)) { setError('Salary expectation must be zero or a positive number.'); return }
     setBusy(true); setError('')
     try {
       const candidates = []
@@ -321,23 +350,20 @@ function UploadModal({ onClose, onAdd, candidateCount }) {
         const fileText = await extractFileText(file)
         if (!fileText.trim()) throw new Error(`${file.name}: no readable text found. Paste the resume text to evaluate a scanned document.`)
         const fallback = file.name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ')
-        const lines = fileText.split('\n').map((line) => line.trim()).filter(Boolean)
-        const nameLine = lines.find((line) => /^(?:[A-Z][a-z]{1,30}\s+){1,3}[A-Z][a-z]{1,30}$/.test(line))
-        const firstLine = lines.find((line) => line.length > 2)
-        candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: (files.length === 1 && name.trim()) || nameLine || firstLine?.slice(0, 45) || fallback, role: 'New applicant', source: 'Upload', expectedSalaryLpa: salary === '' ? undefined : Number(salary), text: fileText + (text.trim() ? `\n\nCOVER NOTE\n${text.trim()}` : '') })
+        candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: (files.length === 1 && name.trim()) || detectName(fileText) || fallback, role: 'New applicant', source: 'Upload', expectedSalaryLpa: salary === '' ? undefined : Number(salary), text: fileText + (text.trim() ? `\n\nCOVER NOTE\n${text.trim()}` : '') })
       }
-      if (text.trim() && !files.length) candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: name.trim() || 'Pasted applicant', role: 'New applicant', source: 'Pasted text', expectedSalaryLpa: salary === '' ? undefined : Number(salary), text })
+      if (text.trim() && !files.length) candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: name.trim() || detectName(text) || 'Pasted applicant', role: 'New applicant', source: 'Pasted text', expectedSalaryLpa: salary === '' ? undefined : Number(salary), text })
       onAdd(candidates)
     } catch (err) { setError(err.message || 'Could not read that application.'); setBusy(false) }
   }
   return (
-    <Modal onClose={onClose}>
-      <div className="modal-header"><div><span className="overline">NEW SCREENING</span><h2>Add applications</h2><p>Upload resumes or paste application text. Files are analyzed locally in this demo.</p></div><button className="icon-button" onClick={onClose}><X size={20} /></button></div>
+    <Modal onClose={onClose} label="Add applications">
+      <div className="modal-header"><div><span className="overline">NEW SCREENING</span><h2>Add applications</h2><p>Upload resumes or paste application text. Files are analyzed locally in this demo.</p></div><button className="icon-button" onClick={onClose} aria-label="Close add applications"><X size={20} /></button></div>
       <div className="upload-body">
         <button className={`dropzone ${dragging ? 'dragging' : ''}`} onClick={() => fileRef.current.click()} onDragOver={(e) => { e.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(e) => { e.preventDefault(); setDragging(false); addFiles(e.dataTransfer.files) }}>
-          <CloudUpload size={28} /><strong>Drop resumes here, or click to browse</strong><span>PDF, DOCX, TXT, or MD · multiple files supported</span><input ref={fileRef} type="file" hidden multiple accept=".pdf,.docx,.txt,.md" onChange={(e) => addFiles(e.target.files)} />
+          <CloudUpload size={28} /><strong>Drop resumes here, or click to browse</strong><span>PDF, DOCX, TXT, or MD · multiple files · 10 MB each</span><input ref={fileRef} type="file" hidden multiple accept=".pdf,.docx,.txt,.md" onChange={(e) => { addFiles(e.target.files); e.target.value = '' }} />
         </button>
-        {files.length > 0 && <div className="file-list">{files.map((file, i) => <div key={`${file.name}-${i}`}><FileText size={16} /><span>{file.name}<small>{Math.max(1, Math.round(file.size / 1024))} KB</small></span><button onClick={() => setFiles(files.filter((_, idx) => idx !== i))}><X size={15} /></button></div>)}</div>}
+        {files.length > 0 && <div className="file-list">{files.map((file, i) => <div key={`${file.name}-${i}`}><FileText size={16} /><span>{file.name}<small>{Math.max(1, Math.round(file.size / 1024))} KB</small></span><button onClick={() => setFiles(files.filter((_, idx) => idx !== i))} aria-label={`Remove ${file.name}`}><X size={15} /></button></div>)}</div>}
         <div className="or"><span>or paste application text</span></div>
         <label className="field"><span>Candidate name <small>optional</small></span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Priya Nair" /></label><label className="field"><span>Candidate-provided salary expectation (₹ LPA) <small>optional · used only if requisition has a cap</small></span><input type="number" min="0" value={salary} onChange={(e) => setSalary(e.target.value)} placeholder="e.g. 8" /></label>
         <label className="field"><span>{files.length ? 'Cover note for the uploaded resume (optional)' : 'Resume + cover note'}</span><textarea value={text} onChange={(e) => setText(e.target.value)} placeholder={files.length ? 'Paste this applicant’s cover note to cross-check it against their resume…' : 'Paste the complete application here…'} rows={7} /></label>
@@ -351,18 +377,18 @@ function UploadModal({ onClose, onAdd, candidateCount }) {
 function EditRequisition({ requisition, onClose, onSave }) {
   const [draft, setDraft] = useState(() => structuredClone(requisition))
   const updateCriterion = (index, field, value) => setDraft({ ...draft, criteria: draft.criteria.map((c, i) => i === index ? { ...c, [field]: value } : c) })
-  const updateConstraint = (field, value) => setDraft({ ...draft, constraints: { minExperienceYears: 0, maxSalaryLpa: null, seniority: 'junior', ...(draft.constraints || {}), [field]: value } })
+  const updateConstraint = (field, value) => setDraft({ ...draft, constraints: { minExperienceYears: 0, maxSalaryLpa: null, seniority: 'junior', ...(draft.constraints || {}), [field]: typeof value === 'number' ? Math.max(0, value) : value } })
   return (
-    <Modal onClose={onClose} wide>
-      <div className="modal-header"><div><span className="overline">JR-2048</span><h2>Edit requisition criteria</h2><p>Assessments refresh immediately after you save.</p></div><button className="icon-button" onClick={onClose}><X size={20} /></button></div>
-      <div className="edit-body"><div className="edit-top"><label className="field"><span>Role title</span><input value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} /></label><label className="field"><span>Team & location</span><input value={draft.team} onChange={(e) => setDraft({ ...draft, team: e.target.value })} /></label></div><div className="constraint-editor"><span className="overline">RESTRICTIVE REQUIREMENTS</span><p>These fields are checked against the whole pool and against the role level.</p><div><label className="field"><span>Minimum documented experience (years)</span><input type="number" min="0" value={draft.constraints?.minExperienceYears ?? 0} onChange={(e) => updateConstraint('minExperienceYears', Number(e.target.value) || 0)} /></label><label className="field"><span>Maximum salary (₹ LPA) <small>optional</small></span><input type="number" min="0" value={draft.constraints?.maxSalaryLpa ?? ''} onChange={(e) => updateConstraint('maxSalaryLpa', e.target.value === '' ? null : Number(e.target.value))} /></label><label className="field"><span>Target level</span><select value={draft.constraints?.seniority || 'junior'} onChange={(e) => updateConstraint('seniority', e.target.value)}><option value="junior">Junior / entry</option><option value="mid">Mid-level</option><option value="senior">Senior</option></select></label></div></div><p className="edit-helper">Aliases let equivalent wording count toward the same skill. Separate terms with commas.</p><div className="criteria-editor">{draft.criteria.map((criterion, index) => <div className="criterion-edit" key={criterion.id}><span className={`criterion-type ${criterion.type}`}>{criterion.type}</span><div><input className="criterion-name-input" value={criterion.name} onChange={(e) => updateCriterion(index, 'name', e.target.value)} /><textarea rows={2} value={criterion.description} onChange={(e) => updateCriterion(index, 'description', e.target.value)} /><label><span>Equivalent terms</span><input value={criterion.aliases.join(', ')} onChange={(e) => updateCriterion(index, 'aliases', e.target.value.split(',').map((x) => x.trim()).filter(Boolean))} /></label></div></div>)}</div></div>
+    <Modal onClose={onClose} wide label="Edit requisition criteria">
+      <div className="modal-header"><div><span className="overline">JR-2048</span><h2>Edit requisition criteria</h2><p>Assessments refresh immediately after you save.</p></div><button className="icon-button" onClick={onClose} aria-label="Close requisition editor"><X size={20} /></button></div>
+      <div className="edit-body"><div className="edit-top"><label className="field"><span>Role title</span><input value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} /></label><label className="field"><span>Team & location</span><input value={draft.team} onChange={(e) => setDraft({ ...draft, team: e.target.value })} /></label></div><div className="constraint-editor"><span className="overline">RESTRICTIVE REQUIREMENTS</span><p>These fields are checked against the whole pool and against the role level.</p><div><label className="field"><span>Minimum documented experience (years)</span><input type="number" min="0" value={draft.constraints?.minExperienceYears ?? 0} onChange={(e) => updateConstraint('minExperienceYears', Number(e.target.value) || 0)} /></label><label className="field"><span>Maximum salary (₹ LPA) <small>optional</small></span><input type="number" min="0" value={draft.constraints?.maxSalaryLpa ?? ''} onChange={(e) => updateConstraint('maxSalaryLpa', e.target.value === '' ? null : Number(e.target.value))} /></label><label className="field"><span>Target level</span><select value={draft.constraints?.seniority || 'junior'} onChange={(e) => updateConstraint('seniority', e.target.value)}><option value="junior">Junior / entry</option><option value="mid">Mid-level</option><option value="senior">Senior</option></select></label></div></div><p className="edit-helper">Aliases let equivalent wording count toward the same skill. Separate terms with commas.</p><div className="criteria-editor">{draft.criteria.map((criterion, index) => <div className="criterion-edit" key={criterion.id}><span className={`criterion-type ${criterion.type}`}>{criterion.type}</span><div><input className="criterion-name-input" aria-label={`Criterion ${index + 1} name`} value={criterion.name} onChange={(e) => updateCriterion(index, 'name', e.target.value)} /><textarea rows={2} aria-label={`${criterion.name} description`} value={criterion.description} onChange={(e) => updateCriterion(index, 'description', e.target.value)} /><label><span>Equivalent terms</span><input value={criterion.aliases.join(', ')} onChange={(e) => updateCriterion(index, 'aliases', e.target.value.split(',').map((x) => x.trim()).filter(Boolean))} /></label></div></div>)}</div></div>
       <div className="modal-footer"><button className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" onClick={() => onSave(draft)}><Check size={17} /> Save & rescreen</button></div>
     </Modal>
   )
 }
 
 function CompareModal({ candidates, requisition, onClose, onOpen }) {
-  return <Modal onClose={onClose} wide><div className="modal-header"><div><span className="overline">SIDE-BY-SIDE</span><h2>Candidate trade-offs</h2><p>Compare evidence by criterion. No composite score hides the differences.</p></div><button className="icon-button" onClick={onClose}><X size={20} /></button></div><div className="compare-matrix"><div className="compare-grid compare-head"><span>Criterion</span>{candidates.map((candidate) => <button key={candidate.id} onClick={() => onOpen(candidate)}><Avatar name={candidate.name} size="sm" /><span><strong>{candidate.name}</strong><small>{candidate.band}</small></span></button>)}</div>{requisition.criteria.map((criterion) => <div className="compare-grid" key={criterion.id}><span className="matrix-criterion"><strong>{criterion.name}</strong><small>{criterion.type}</small></span>{candidates.map((candidate) => { const item = candidate.assessments.find((a) => a.criterionId === criterion.id); return <div className="matrix-cell" key={candidate.id}><LevelPill level={item.level} compact /><p>{item.evidence[0] || 'No supporting passage found.'}</p></div> })}</div>)}</div><div className="modal-footer"><button className="primary-button" onClick={onClose}>Done comparing</button></div></Modal>
+  return <Modal onClose={onClose} wide label="Compare candidate trade-offs"><div className="modal-header"><div><span className="overline">SIDE-BY-SIDE</span><h2>Candidate trade-offs</h2><p>Compare evidence by criterion. No composite score hides the differences.</p></div><button className="icon-button" onClick={onClose} aria-label="Close comparison"><X size={20} /></button></div><div className="compare-matrix" style={{ '--compare-count': candidates.length }}><div className="compare-grid compare-head"><span>Criterion</span>{candidates.map((candidate) => <button key={candidate.id} onClick={() => onOpen(candidate)}><Avatar name={candidate.name} size="sm" /><span><strong>{candidate.name}</strong><small>{candidate.band}</small></span></button>)}</div>{requisition.criteria.map((criterion) => <div className="compare-grid" key={criterion.id}><span className="matrix-criterion"><strong>{criterion.name}</strong><small>{criterion.type}</small></span>{candidates.map((candidate) => { const item = candidate.assessments.find((a) => a.criterionId === criterion.id); return <div className="matrix-cell" key={candidate.id}><LevelPill level={item.level} compact /><p>{item.evidence[0] || 'No supporting passage found.'}</p></div> })}</div>)}</div><div className="modal-footer"><button className="primary-button" onClick={onClose}>Done comparing</button></div></Modal>
 }
 
 function CompareTray({ selected, screened, onClear, onOpen, onCompare }) {
@@ -373,13 +399,14 @@ function CompareTray({ selected, screened, onClear, onOpen, onCompare }) {
 
 function HelpModal({ onClose }) {
   return <Modal onClose={onClose} wide label="How Verity scoring works">
-    <div className="modal-header"><div><span className="overline">GUIDE</span><h2>How the screening works</h2><p>Every result is based on text present in the submitted application.</p></div><button className="icon-button" onClick={onClose} aria-label="Close guide"><X size={20} /></button></div>
+    <div className="modal-header"><div><span className="overline">GUIDE</span><h2>How the screening works</h2><p>Every result is grounded in the submitted application, optionally cross-checked against verified external evidence.</p></div><button className="icon-button" onClick={onClose} aria-label="Close guide"><X size={20} /></button></div>
     <div className="help-body">
       <section><span className="help-step">1</span><div><h3>Match equivalent terms</h3><p>Criteria use aliases, so Kafka, Pub/Sub and RabbitMQ can all support distributed-systems experience.</p></div></section>
       <section><span className="help-step">2</span><div><h3>Check evidence quality</h3><p>Action verbs, operating context and measurable outcomes strengthen evidence. A skills list or course alone does not carry the same weight.</p></div></section>
       <section><span className="help-step">3</span><div><h3>Check application consistency</h3><p>Claims are compared with dates, responsibilities and cover-note statements. Flags quote the exact passages reviewed and are not a finding of dishonesty.</p></div></section>
-      <section><span className="help-step">4</span><div><h3>Show trade-offs and pool gaps</h3><p>Ranking stays explainable. Candidate comparison and pool insights show strengths, gaps and requirements no applicant fully meets.</p></div></section>
-      <div className="help-note"><ShieldCheck size={18} /><p>Confidence reflects support in the submitted application, not the probability that a candidate is truthful. Human review remains the final decision.</p></div>
+      <section><span className="help-step">4</span><div><h3>Cross-check external evidence</h3><p>A verified GitHub repo or authorized LinkedIn export touching the same skill can nudge that criterion's confidence up by one step, capped below "strong" — never enough to erase a contradiction, always cited to its exact source.</p></div></section>
+      <section><span className="help-step">5</span><div><h3>Show trade-offs and pool gaps</h3><p>Ranking stays explainable. Candidate comparison and pool insights show strengths, gaps and requirements no applicant fully meets.</p></div></section>
+      <div className="help-note"><ShieldCheck size={18} /><p>Confidence reflects support in the submitted application and any verified external evidence, not the probability that a candidate is truthful. Human review remains the final decision.</p></div>
     </div>
     <div className="modal-footer"><button className="primary-button" onClick={onClose}>Got it</button></div>
   </Modal>
@@ -391,25 +418,51 @@ function VerificationModal({ candidate, requisition, onClose, onSave }) {
   const [linkedinText, setLinkedinText] = useState('')
   const [githubResult, setGithubResult] = useState(candidate.verification?.github || null)
   const [linkedinResult, setLinkedinResult] = useState(candidate.verification?.linkedin || null)
+  const [searchResults, setSearchResults] = useState(null)
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const request = async (path, body) => {
-    const response = await fetch(`${AGENT_API}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    const response = await fetch(`${AGENT_API}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) })
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).message || 'The verification service is unavailable. Start the app with npm run dev:full.')
     return response.json()
   }
-  const checkGitHub = async () => {
+  const checkGitHub = async (urlOverride) => {
+    const url = urlOverride ?? githubUrl
     setBusy('github'); setError('')
-    try { const result = await request('/api/verify/github', { profileUrl: githubUrl, requisition }); setGithubResult(result); onSave({ github: result }) }
+    try { const result = AGENT_API ? await request('/api/verify/github', { profileUrl: url, requisition }) : await verifyGitHubProfile(url, requisition); setGithubResult(result); onSave({ github: result }) }
     catch (err) { setError(err.message) } finally { setBusy('') }
   }
-  const checkLinkedIn = async () => {
+  const checkLinkedIn = async (urlOverride) => {
+    const url = urlOverride ?? linkedinUrl
     setBusy('linkedin'); setError('')
-    try { const result = await request('/api/verify/linkedin', { url: linkedinUrl, authorizedText: linkedinText, requisition }); setLinkedinResult(result); onSave({ linkedin: result }) }
+    try { const result = AGENT_API ? await request('/api/verify/linkedin', { url, authorizedText: linkedinText, requisition }) : verifyLinkedInEvidence({ url, authorizedText: linkedinText, requisition }); setLinkedinResult(result); onSave({ linkedin: result }) }
     catch (err) { setError(err.message) } finally { setBusy('') }
   }
+  const chooseGithubMatch = (profile) => { setSearchResults(null); setGithubUrl(profile.url); checkGitHub(profile.url) }
+  // A resume-provided link is used automatically — nothing is being inferred,
+  // the candidate wrote it themselves. With no link, fall back to searching by
+  // the recruiter-entered name so a human confirms the match before it's used.
+  const resumeGithubUrl = extractGithubUrl(candidate.text)
+  const resumeLinkedinUrl = extractLinkedInUrl(candidate.text)
+  useEffect(() => {
+    if (candidate.verification?.github) return
+    if (resumeGithubUrl) { Promise.resolve().then(() => { setGithubUrl(resumeGithubUrl); checkGitHub(resumeGithubUrl) }); return }
+    Promise.resolve().then(() => setSearching(true))
+    ;(AGENT_API ? request('/api/verify/github/search', { name: candidate.name }).then((r) => r.results) : searchGitHubProfiles(candidate.name))
+      .then(setSearchResults)
+      .catch((err) => setSearchError(err.message))
+      .finally(() => setSearching(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candidate.id])
+  useEffect(() => {
+    if (candidate.verification?.linkedin) return
+    if (resumeLinkedinUrl) Promise.resolve().then(() => { setLinkedinUrl(resumeLinkedinUrl); checkLinkedIn(resumeLinkedinUrl) })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candidate.id])
   const renderResult = (result) => result && <div className={`provider-result ${result.status}`}><strong>{result.provider} · {result.status.replaceAll('-', ' ')}</strong><p>{result.message || result.disclaimer}</p>{result.profile && <p>Profile: <a href={result.profile.url} target="_blank" rel="noreferrer">@{result.profile.handle} <ExternalLink size={12} /></a> · {result.profile.publicRepos} public repos</p>}{result.evidence?.length > 0 && <ul>{result.evidence.slice(0, 4).map((item, index) => <li key={item.url || index}>{typeof item === 'string' ? item : <a href={item.url} target="_blank" rel="noreferrer">{item.name} · {item.language} <ExternalLink size={11} /></a>}</li>)}</ul>}{result.criteriaSignals?.length > 0 && <p><strong>Terminology signals to review:</strong> {[...new Set(result.criteriaSignals.map((signal) => signal.criterion))].join(', ')}. These are not proficiency scores.</p>}</div>
-  return <Modal onClose={onClose} wide label="External evidence review"><div className="modal-header"><div><span className="overline">CONSENT-BASED VERIFICATION</span><h2>External evidence review</h2><p>For {candidate.name}. Findings are separate from the application fit score until reviewed by a person.</p></div><button className="icon-button" onClick={onClose} aria-label="Close verification"><X size={20} /></button></div><div className="verification-body"><section className="provider-card"><div><GitBranch size={21} /><div><h3>GitHub public evidence</h3><p>Read-only public profile and repository metadata. It cannot prove authorship, skill level or employment.</p></div></div><label className="field"><span>Candidate-provided GitHub profile</span><input value={githubUrl} onChange={(event) => setGithubUrl(event.target.value)} placeholder="https://github.com/username" /></label><button className="secondary-button" disabled={busy === 'github'} onClick={checkGitHub}>{busy === 'github' ? 'Checking…' : 'Review public GitHub'}</button>{renderResult(githubResult)}</section><section className="provider-card"><div><Link2 size={21} /><div><h3>LinkedIn authorized evidence</h3><p>No profile scraping. Use a candidate-authorized export here, or replace this adapter with your organization’s approved LinkedIn integration.</p></div></div><label className="field"><span>Public profile link <small>optional</small></span><input value={linkedinUrl} onChange={(event) => setLinkedinUrl(event.target.value)} placeholder="https://www.linkedin.com/in/..." /></label><label className="field"><span>Candidate-authorized profile export</span><textarea rows={5} value={linkedinText} onChange={(event) => setLinkedinText(event.target.value)} placeholder="Paste experience or project text the candidate has authorized you to use…" /></label><button className="secondary-button" disabled={busy === 'linkedin'} onClick={checkLinkedIn}>{busy === 'linkedin' ? 'Comparing…' : 'Compare authorized export'}</button>{renderResult(linkedinResult)}</section>{error && <div className="form-error"><AlertCircle size={16} />{error}</div>}<div className="consent-note"><ShieldAlert size={18} /><p>Recruiter safeguard: never use protected characteristics, inferred identity, network connections, or private data in the fit assessment. These providers are evidence sources for human review—not automatic background checks.</p></div></div><div className="modal-footer"><button className="primary-button" onClick={onClose}>Done</button></div></Modal>
+  return <Modal onClose={onClose} wide label="External evidence review"><div className="modal-header"><div><span className="overline">CONSENT-BASED VERIFICATION</span><h2>External evidence review</h2><p>For {candidate.name}. A matching skill term here is folded into that criterion's confidence as a small, capped, cited cross-check — see it under "Cross-checked against external evidence" on the Criterion assessment tab. It never overrides a contradiction and can't push a criterion to "strong" on its own.</p></div><button className="icon-button" onClick={onClose} aria-label="Close verification"><X size={20} /></button></div><div className="verification-body"><section className="provider-card"><div><GitBranch size={21} /><div><h3>GitHub public evidence</h3><p>Read-only public profile and repository metadata. It cannot prove authorship, skill level or employment.</p></div></div>{resumeGithubUrl && githubUrl === resumeGithubUrl && <small className="auto-detected"><Sparkles size={12} /> Link found in the resume — checked automatically.</small>}<label className="field"><span>Candidate-provided GitHub profile</span><input value={githubUrl} onChange={(event) => setGithubUrl(event.target.value)} placeholder="https://github.com/username" /></label><button className="secondary-button" disabled={busy === 'github'} onClick={() => checkGitHub()}>{busy === 'github' ? 'Checking…' : 'Review public GitHub'}</button>{!githubUrl && (searching ? <p className="search-status">Searching GitHub for “{candidate.name}”…</p> : searchResults && (searchResults.length ? <div className="github-search-results"><span>No link in the resume. Possible matches for “{candidate.name}” — confirm before using one:</span>{searchResults.map((profile) => <div className="github-search-row" key={profile.login}><img src={profile.avatarUrl} alt="" width={24} height={24} /><a href={profile.url} target="_blank" rel="noreferrer">@{profile.login} <ExternalLink size={11} /></a><button className="text-link" onClick={() => chooseGithubMatch(profile)}>Use this profile</button></div>)}</div> : <p className="search-status">No GitHub profiles found for “{candidate.name}”. Enter a profile URL if you have one.</p>))}{searchError && <p className="search-status">{searchError}</p>}{renderResult(githubResult)}</section><section className="provider-card"><div><Link2 size={21} /><div><h3>LinkedIn authorized evidence</h3><p>No profile scraping. Use a candidate-authorized export here, or replace this adapter with your organization’s approved LinkedIn integration.</p></div></div>{resumeLinkedinUrl && linkedinUrl === resumeLinkedinUrl && <small className="auto-detected"><Sparkles size={12} /> Link found in the resume — add an authorized export below to compare it.</small>}<label className="field"><span>Public profile link <small>optional</small></span><input value={linkedinUrl} onChange={(event) => setLinkedinUrl(event.target.value)} placeholder="https://www.linkedin.com/in/..." /></label><label className="field"><span>Candidate-authorized profile export</span><textarea rows={5} value={linkedinText} onChange={(event) => setLinkedinText(event.target.value)} placeholder="Paste experience or project text the candidate has authorized you to use…" /></label><button className="secondary-button" disabled={busy === 'linkedin'} onClick={() => checkLinkedIn()}>{busy === 'linkedin' ? 'Comparing…' : 'Compare authorized export'}</button>{renderResult(linkedinResult)}</section>{error && <div className="form-error"><AlertCircle size={16} />{error}</div>}<div className="consent-note"><ShieldAlert size={18} /><p>Recruiter safeguard: never use protected characteristics, inferred identity, network connections, or private data in the fit assessment. These providers are evidence sources for human review—not automatic background checks.</p></div></div><div className="modal-footer"><button className="primary-button" onClick={onClose}>Done</button></div></Modal>
 }
 
 function AgentOperations({ screened, onOpen, onRun, busy }) {
@@ -422,7 +475,7 @@ export default function App() {
   const [view, setView] = useState('overview')
   const [requisition, setRequisition] = useState(() => readStored(STORAGE.requisition, defaultRequisition))
   const [candidates, setCandidates] = useState(() => readStored(STORAGE.candidates, sampleCandidates))
-  const [activeCandidate, setActiveCandidate] = useState(null)
+  const [activeCandidateId, setActiveCandidateId] = useState(null)
   const [showUpload, setShowUpload] = useState(false)
   const [showEdit, setShowEdit] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -434,10 +487,15 @@ export default function App() {
   const [agentBusy, setAgentBusy] = useState('')
   const [candidateFilter, setCandidateFilter] = useState('all')
   const screened = useMemo(() => screenPool(candidates, requisition), [candidates, requisition])
+  // Derived, not stored: always the current screened entry for this id, so a
+  // live verification or agent-run update is reflected immediately instead of
+  // needing a hand-patched snapshot that can drift out of sync (assessments,
+  // confidence, band recompute here automatically along with .verification).
+  const activeCandidate = activeCandidateId ? screened.find((c) => c.id === activeCandidateId) || null : null
   const insights = useMemo(() => getPoolInsights(screened, requisition), [screened, requisition])
   const requisitionAnalysis = useMemo(() => analyzeRequisition(screened, requisition), [screened, requisition])
-  useEffect(() => { localStorage.setItem(STORAGE.candidates, JSON.stringify(candidates)) }, [candidates])
-  useEffect(() => { localStorage.setItem(STORAGE.requisition, JSON.stringify(requisition)) }, [requisition])
+  useEffect(() => { try { localStorage.setItem(STORAGE.candidates, JSON.stringify(candidates)) } catch { /* Keep the current in-memory session usable when storage is unavailable. */ } }, [candidates])
+  useEffect(() => { try { localStorage.setItem(STORAGE.requisition, JSON.stringify(requisition)) } catch { /* Keep the current in-memory session usable when storage is unavailable. */ } }, [requisition])
   const selectCandidate = (id) => setSelected((current) => current.includes(id) ? current.filter((x) => x !== id) : current.length < 3 ? [...current, id] : current)
   const applyFilter = (filter) => { setCandidateFilter(filter); setView('candidates') }
   const resetDemo = () => {
@@ -447,78 +505,37 @@ export default function App() {
   const removeCandidate = (id) => {
     const candidate = candidates.find((item) => item.id === id)
     if (!candidate || !window.confirm(`Remove ${candidate.name} from this local applicant pool?`)) return
-    setCandidates((current) => current.filter((item) => item.id !== id)); setSelected((current) => current.filter((item) => item !== id)); setActiveCandidate(null); setToast(`${candidate.name} removed from this device`); setTimeout(() => setToast(''), 3500)
+    setCandidates((current) => current.filter((item) => item.id !== id)); setSelected((current) => current.filter((item) => item !== id)); setActiveCandidateId(null); setToast(`${candidate.name} removed from this device`); setTimeout(() => setToast(''), 3500)
   }
-  const exportReport = () => {
-    const workbook = XLSX.utils.book_new()
-    const fullMatchById = new Map(requisitionAnalysis.candidates.map((item) => [item.candidate.id, item]))
-    const addSheet = (name, rows, widths) => {
-      const sheet = XLSX.utils.json_to_sheet(rows)
-      sheet['!cols'] = widths.map((width) => ({ wch: width }))
-      XLSX.utils.book_append_sheet(workbook, sheet, name)
-    }
-    addSheet('Summary', [
-      { Metric: 'Generated at', Value: new Date().toLocaleString() },
-      { Metric: 'Requisition', Value: requisition.title },
-      { Metric: 'Applicants analyzed', Value: screened.length },
-      { Metric: 'Strong matches', Value: screened.filter((candidate) => ['Leading match', 'Strong match'].includes(candidate.band)).length },
-      { Metric: 'Claim checks', Value: screened.reduce((total, candidate) => total + candidate.flags.length, 0) },
-      { Metric: 'Full requisition matches', Value: requisitionAnalysis.fullMatches.length },
-      { Metric: 'Shortlisting safeguard', Value: requisitionAnalysis.noFullMatch ? 'No candidate fully satisfies all required criteria.' : 'At least one candidate fully satisfies all required criteria.' },
-      { Metric: 'Pool-wide gaps', Value: insights.filter((item) => item.isGap).map((item) => item.name).join('; ') || 'None' },
-    ], [28, 95])
-    addSheet('Shortlist', screened.map((candidate, index) => {
-      const match = fullMatchById.get(candidate.id)
-      return { Rank: index + 1, ID: candidate.id, Candidate: candidate.name, Role: candidate.role, 'Fit band': candidate.band, 'Required strong': `${candidate.requiredStrong}/${candidate.requiredTotal}`, 'Evidence coverage': `${candidate.evidenceCoverage}%`, 'Assessment confidence': `${candidate.confidence}%`, 'Full requisition match': match?.fullyMeets ? 'Yes' : 'No', Strengths: match?.strengths.join('; ') || candidate.strength, 'Visible trade-offs': match?.tradeoffs.join('; ') || candidate.tradeoff, 'Claim checks': candidate.flags.length }
-    }), [7, 10, 22, 24, 18, 16, 18, 22, 22, 46, 70, 13])
-    addSheet('Criterion evidence', screened.flatMap((candidate) => candidate.assessments.map((assessment) => ({
-      ID: candidate.id, Candidate: candidate.name, Criterion: requisition.criteria.find((criterion) => criterion.id === assessment.criterionId)?.name, Type: requisition.criteria.find((criterion) => criterion.id === assessment.criterionId)?.type, Assessment: levelLabels[assessment.level], Confidence: `${assessment.confidence}%`, 'Equivalent terms': assessment.terms.join(', '), 'Cited evidence': assessment.evidence.join(' | '), Rationale: assessment.reason,
-    }))), [10, 22, 34, 12, 19, 13, 28, 85, 68])
-    addSheet('Claim checks', screened.flatMap((candidate) => candidate.flags.map((flag) => ({
-      ID: candidate.id, Candidate: candidate.name, Flag: flag.kind.toUpperCase(), Rule: flag.rule, Claim: flag.claim.quote, 'Claim source': `${flag.claim.section}, line ${flag.claim.line}`, 'Evidence reviewed': flag.evidence.map((evidence) => evidence.quote).join(' | ') || 'No separate supporting passage found', Assessment: flag.assessment,
-    }))), [10, 22, 20, 22, 58, 25, 85, 75])
-    addSheet('Requisition analysis', [
-      ...requisitionAnalysis.conflicts.map((conflict) => ({ Category: 'Conflict / restriction', Requirement: conflict.title, Pool_coverage: '', Finding: conflict.detail })),
-      ...requisitionAnalysis.requirementCoverage.map((item) => ({ Category: item.type === 'constraint' ? 'Constraint coverage' : 'Required criterion coverage', Requirement: item.name, Pool_coverage: `${item.met}/${item.total} (${item.coverage}%)`, Finding: item.met === 0 ? 'No candidate has supported evidence / meets this requirement.' : 'See Shortlist for trade-offs.' })),
-    ], [28, 42, 24, 95])
-    addSheet('External evidence review', screened.flatMap((candidate) => {
-      const sources = Object.values(candidate.verification || {}).filter(Boolean)
-      if (!sources.length) return [{ ID: candidate.id, Candidate: candidate.name, Provider: 'None reviewed', Status: 'Not requested', Profile_or_source: '', 'Terminology signals': '', 'Recruiter note': 'No external evidence reviewed. Resume assessment remains based on the submitted application only.' }]
-      return sources.map((source) => ({
-        ID: candidate.id, Candidate: candidate.name, Provider: source.provider, Status: source.status, Profile_or_source: source.profile?.url || source.url || '',
-        'Terminology signals': [...new Set((source.criteriaSignals || []).map((signal) => `${signal.criterion}: ${signal.terms.join(', ')}`))].join(' | '),
-        'Recruiter note': source.disclaimer || source.message || 'Review evidence manually before relying on it.',
-      }))
-    }), [10, 22, 16, 25, 52, 58, 100])
-    addSheet('Interview recommendations', requisitionAnalysis.shortlist.flatMap((item) => {
-      const candidate = item.candidate
-      const flagQuestions = candidate.flags.map((flag) => ({ ID: candidate.id, Candidate: candidate.name, Priority: flag.kind === 'contradictory' ? 'High' : 'Medium', 'Area to validate': flag.rule.replaceAll('-', ' '), 'Why ask': flag.assessment, 'Suggested interview question': `Please walk us through this statement: “${flag.claim.quote}”. What was your specific responsibility, timeline, and outcome?` }))
-      const gapQuestions = item.unmetCriteria.map((criterion) => ({ ID: candidate.id, Candidate: candidate.name, Priority: 'Medium', 'Area to validate': criterion, 'Why ask': 'Required evidence is partial, emerging, or absent in the submitted application.', 'Suggested interview question': `Describe the most relevant hands-on example you have for ${criterion}. What did you personally build, operate, or improve, and what was the measurable outcome?` }))
-      const constraintQuestions = item.unmetConstraints.map((constraint) => ({ ID: candidate.id, Candidate: candidate.name, Priority: 'High', 'Area to validate': 'Requisition constraint', 'Why ask': constraint, 'Suggested interview question': 'Please clarify this requirement during the recruiter screen before progressing the candidate.' }))
-      return [...flagQuestions, ...gapQuestions, ...constraintQuestions].length ? [...flagQuestions, ...gapQuestions, ...constraintQuestions] : [{ ID: candidate.id, Candidate: candidate.name, Priority: 'Low', 'Area to validate': 'Depth and ownership', 'Why ask': 'No material gap was identified by the initial evidence review.', 'Suggested interview question': 'Choose one cited project and explain your individual ownership, a technical trade-off, and how you measured success.' }]
-    }), [10, 22, 12, 34, 72, 105])
-    XLSX.writeFile(workbook, `verity-screening-report-${new Date().toISOString().slice(0, 10)}.xlsx`, { compression: true })
-    setToast('Excel screening workbook downloaded'); setTimeout(() => setToast(''), 3500)
+  const exportReport = async () => {
+    try {
+      setToast('Preparing Excel screening workbook…')
+      await downloadScreeningWorkbook({ screened, requisition, insights, requisitionAnalysis })
+      setToast('Excel screening workbook downloaded')
+    } catch (error) { setToast(`Could not export report: ${error.message}`) }
+    setTimeout(() => setToast(''), 3500)
   }
   const addCandidates = (newCandidates) => {
     setCandidates((current) => [...current, ...newCandidates]); setShowUpload(false); setView('candidates'); setToast(`${newCandidates.length} application${newCandidates.length > 1 ? 's' : ''} screened successfully`); setTimeout(() => setToast(''), 3500)
   }
   const saveVerification = (candidateId, update) => {
     setCandidates((current) => current.map((candidate) => candidate.id === candidateId ? { ...candidate, verification: { ...candidate.verification, ...update } } : candidate))
-    setActiveCandidate((current) => current?.id === candidateId ? { ...current, verification: { ...current.verification, ...update } } : current)
   }
   const runAgent = async (candidate) => {
     setAgentBusy(candidate.id)
     try {
       let review
       try {
-        const response = await fetch(`${AGENT_API}/api/agent/screen`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ candidate, requisition }) })
+        if (!AGENT_API) throw new Error('Use browser agent')
+        const response = await fetch(`${AGENT_API}/api/agent/screen`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ candidate, requisition }), signal: AbortSignal.timeout(8000) })
         if (!response.ok) throw new Error('Agent service returned an error')
         review = await response.json()
         review.mode = 'langchain-api'
-      } catch { review = await runBrowserLangChain(candidate) }
+      } catch {
+        const { runBrowserLangChain } = await import('./browserAgent')
+        review = await runBrowserLangChain(candidate)
+      }
       setCandidates((current) => current.map((item) => item.id === candidate.id ? { ...item, agentReview: review } : item))
-      setActiveCandidate((current) => current?.id === candidate.id ? { ...current, agentReview: review } : current)
       setToast(`LangChain review completed for ${candidate.name}`); setTimeout(() => setToast(''), 3500)
     } catch (error) { setToast(error.message); setTimeout(() => setToast(''), 5000) }
     finally { setAgentBusy('') }
@@ -528,18 +545,18 @@ export default function App() {
       <Sidebar view={view} setView={setView} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} />
       {mobileOpen && <button className="mobile-overlay" onClick={() => setMobileOpen(false)} aria-label="Close navigation" />}
       <main><Topbar view={view} openUpload={() => setShowUpload(true)} openHelp={() => setShowHelp(true)} onExport={exportReport} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} /><RequisitionHeader requisition={requisition} screened={screened} onEdit={() => setShowEdit(true)} onFilter={applyFilter} />
-        {view === 'overview' && <Overview screened={screened} insights={insights} onOpen={setActiveCandidate} onNavigate={setView} onFilter={applyFilter} selected={selected} onSelect={selectCandidate} />}
-        {view === 'candidates' && <Candidates screened={screened} onOpen={setActiveCandidate} selected={selected} onSelect={selectCandidate} filterMode={candidateFilter} clearFilter={() => setCandidateFilter('all')} />}
-        {view === 'insights' && <Insights insights={insights} screened={screened} requisition={requisition} requisitionAnalysis={requisitionAnalysis} />}
-        {view === 'agent' && <AgentOperations screened={screened} onOpen={setActiveCandidate} onRun={runAgent} busy={agentBusy} />}
+        {view === 'overview' && <Overview screened={screened} insights={insights} onOpen={(candidate) => setActiveCandidateId(candidate.id)} onNavigate={setView} onFilter={applyFilter} selected={selected} onSelect={selectCandidate} />}
+        {view === 'candidates' && <Candidates screened={screened} onOpen={(candidate) => setActiveCandidateId(candidate.id)} selected={selected} onSelect={selectCandidate} filterMode={candidateFilter} clearFilter={() => setCandidateFilter('all')} />}
+        {view === 'insights' && <Insights insights={insights} screened={screened} requisition={requisition} requisitionAnalysis={requisitionAnalysis} onOpen={(candidate) => setActiveCandidateId(candidate.id)} />}
+        {view === 'agent' && <AgentOperations screened={screened} onOpen={(candidate) => setActiveCandidateId(candidate.id)} onRun={runAgent} busy={agentBusy} />}
       </main>
       {showUpload && <UploadModal onClose={() => setShowUpload(false)} onAdd={addCandidates} candidateCount={candidates.length} />}
       {showEdit && <EditRequisition requisition={requisition} onClose={() => setShowEdit(false)} onSave={(next) => { setRequisition(next); setShowEdit(false); setToast('Requisition saved and applicant pool rescored'); setTimeout(() => setToast(''), 3500) }} />}
       {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
-      {activeCandidate && <CandidateDetail candidate={activeCandidate} requisition={requisition} onClose={() => setActiveCandidate(null)} onRemove={() => removeCandidate(activeCandidate.id)} onVerify={() => setVerificationCandidate(activeCandidate)} onRunAgent={() => runAgent(activeCandidate)} />}
+      {activeCandidate && <CandidateDetail candidate={activeCandidate} requisition={requisition} onClose={() => setActiveCandidateId(null)} onRemove={() => removeCandidate(activeCandidate.id)} onVerify={() => setVerificationCandidate(activeCandidate)} onRunAgent={() => runAgent(activeCandidate)} />}
       {verificationCandidate && <VerificationModal candidate={verificationCandidate} requisition={requisition} onClose={() => setVerificationCandidate(null)} onSave={(update) => saveVerification(verificationCandidate.id, update)} />}
-      {showCompare && <CompareModal candidates={selected.map((id) => screened.find((c) => c.id === id)).filter(Boolean)} requisition={requisition} onClose={() => setShowCompare(false)} onOpen={(candidate) => { setShowCompare(false); setActiveCandidate(candidate) }} />}
-      <CompareTray selected={selected} screened={screened} onClear={() => setSelected([])} onOpen={setActiveCandidate} onCompare={() => setShowCompare(true)} />
+      {showCompare && <CompareModal candidates={selected.map((id) => screened.find((c) => c.id === id)).filter(Boolean)} requisition={requisition} onClose={() => setShowCompare(false)} onOpen={(candidate) => { setShowCompare(false); setActiveCandidateId(candidate.id) }} />}
+      <CompareTray selected={selected} screened={screened} onClear={() => setSelected([])} onOpen={(candidate) => setActiveCandidateId(candidate.id)} onCompare={() => setShowCompare(true)} />
       {toast && <div className="toast"><CheckCircle2 size={18} />{toast}</div>}
       <button className="reset-demo" onClick={resetDemo}><RotateCcw size={14} /> Restore demo data</button>
     </div>

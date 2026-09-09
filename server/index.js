@@ -2,7 +2,7 @@ import 'dotenv/config'
 import cors from 'cors'
 import express from 'express'
 import { createScreeningAgent } from '../agent/orchestrator.js'
-import { verifyGitHubProfile, verifyLinkedInEvidence } from '../agent/verifiers.js'
+import { verifyGitHubProfile, verifyLinkedInEvidence, searchGitHubProfiles } from '../agent/verifiers.js'
 
 const app = express()
 app.use(cors())
@@ -25,6 +25,11 @@ app.post('/api/verify/github', async (req, res) => {
 })
 
 app.post('/api/verify/linkedin', (req, res) => res.json(verifyLinkedInEvidence(req.body || {})))
+
+app.post('/api/verify/github/search', async (req, res) => {
+  try { res.json({ results: await searchGitHubProfiles(req.body?.name) }) }
+  catch (error) { res.status(502).json({ results: [], message: error.message || 'GitHub search unavailable.' }) }
+})
 
 const port = Number(process.env.AGENT_PORT || 8787)
 app.listen(port, () => console.log(`Verity agent API listening on http://127.0.0.1:${port}`))
