@@ -258,7 +258,7 @@ function CandidateDetail({ candidate, requisition, onClose, onRemove, onVerify, 
                 <div className="assessment-title"><span><small>{criterion.type}{criterion.stretch ? ' · stretch' : ''}</small><h4>{criterion.name}</h4></span><LevelPill level={assessment.level} /></div>
                 <p className="assessment-reason">{assessment.reason}</p>
                 {assessment.evidence.length ? <div className="evidence-box"><span>Evidence found</span>{assessment.evidence.map((line, i) => <blockquote key={i}>“{line}”</blockquote>)}{assessment.terms.length > 0 && <small>Equivalent terms recognized: {assessment.terms.join(', ')}</small>}</div> : <div className="no-evidence"><AlertCircle size={15} /> No supporting passage found in this application.</div>}
-                <div className="confidence-line"><span>Assessment confidence</span><div><i style={{ width: `${assessment.confidence}%` }} /></div><b>{assessment.confidence}%</b></div>
+                <div className="confidence-line"><span>Evidence confidence</span><div><i style={{ width: `${assessment.confidence}%` }} /></div><b>{assessment.confidence}%</b></div>
               </article>
             )
           })}</div>

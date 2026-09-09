@@ -36,7 +36,9 @@ function assessCriterion(text, criterion) {
     return {
       criterionId: criterion.id,
       level: 'not-addressed',
-      confidence: 93,
+      // There is no evidence to be confident in. Absence certainty belongs in
+      // the explanation, not in an evidence-confidence bar shown to recruiters.
+      confidence: 0,
       evidence: [],
       terms: [],
       reason: 'No relevant claim or supporting example found in the application.',

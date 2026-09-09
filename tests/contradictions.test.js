@@ -74,6 +74,11 @@ test('missing criteria do not inflate confidence in unsupported claims', () => {
   assert.ok(result.confidence <= 50)
   assert.ok(result.confidenceReduction > 0)
 })
+
+test('a criterion with no cited passage has zero evidence confidence', () => {
+  const result = screenCandidate({ id: 'no-evidence', name: 'No Evidence', text: 'SUMMARY\nInterested in a career in technology.' }, defaultRequisition)
+  assert.ok(result.assessments.every((assessment) => assessment.level !== 'not-addressed' || assessment.confidence === 0))
+})
 test('time-qualified statements are not treated as unconditional denials', () => {
   assert.ok(!check('Built Python APIs in 2019.\nI have not used Python since 2020.').some((f) => f.kind === 'contradictory'))
 })
