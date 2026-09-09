@@ -481,6 +481,22 @@ export default function App() {
       ...requisitionAnalysis.conflicts.map((conflict) => ({ Category: 'Conflict / restriction', Requirement: conflict.title, Pool_coverage: '', Finding: conflict.detail })),
       ...requisitionAnalysis.requirementCoverage.map((item) => ({ Category: item.type === 'constraint' ? 'Constraint coverage' : 'Required criterion coverage', Requirement: item.name, Pool_coverage: `${item.met}/${item.total} (${item.coverage}%)`, Finding: item.met === 0 ? 'No candidate has supported evidence / meets this requirement.' : 'See Shortlist for trade-offs.' })),
     ], [28, 42, 24, 95])
+    addSheet('External evidence review', screened.flatMap((candidate) => {
+      const sources = Object.values(candidate.verification || {}).filter(Boolean)
+      if (!sources.length) return [{ ID: candidate.id, Candidate: candidate.name, Provider: 'None reviewed', Status: 'Not requested', Profile_or_source: '', 'Terminology signals': '', 'Recruiter note': 'No external evidence reviewed. Resume assessment remains based on the submitted application only.' }]
+      return sources.map((source) => ({
+        ID: candidate.id, Candidate: candidate.name, Provider: source.provider, Status: source.status, Profile_or_source: source.profile?.url || source.url || '',
+        'Terminology signals': [...new Set((source.criteriaSignals || []).map((signal) => `${signal.criterion}: ${signal.terms.join(', ')}`))].join(' | '),
+        'Recruiter note': source.disclaimer || source.message || 'Review evidence manually before relying on it.',
+      }))
+    }), [10, 22, 16, 25, 52, 58, 100])
+    addSheet('Interview recommendations', requisitionAnalysis.shortlist.flatMap((item) => {
+      const candidate = item.candidate
+      const flagQuestions = candidate.flags.map((flag) => ({ ID: candidate.id, Candidate: candidate.name, Priority: flag.kind === 'contradictory' ? 'High' : 'Medium', 'Area to validate': flag.rule.replaceAll('-', ' '), 'Why ask': flag.assessment, 'Suggested interview question': `Please walk us through this statement: “${flag.claim.quote}”. What was your specific responsibility, timeline, and outcome?` }))
+      const gapQuestions = item.unmetCriteria.map((criterion) => ({ ID: candidate.id, Candidate: candidate.name, Priority: 'Medium', 'Area to validate': criterion, 'Why ask': 'Required evidence is partial, emerging, or absent in the submitted application.', 'Suggested interview question': `Describe the most relevant hands-on example you have for ${criterion}. What did you personally build, operate, or improve, and what was the measurable outcome?` }))
+      const constraintQuestions = item.unmetConstraints.map((constraint) => ({ ID: candidate.id, Candidate: candidate.name, Priority: 'High', 'Area to validate': 'Requisition constraint', 'Why ask': constraint, 'Suggested interview question': 'Please clarify this requirement during the recruiter screen before progressing the candidate.' }))
+      return [...flagQuestions, ...gapQuestions, ...constraintQuestions].length ? [...flagQuestions, ...gapQuestions, ...constraintQuestions] : [{ ID: candidate.id, Candidate: candidate.name, Priority: 'Low', 'Area to validate': 'Depth and ownership', 'Why ask': 'No material gap was identified by the initial evidence review.', 'Suggested interview question': 'Choose one cited project and explain your individual ownership, a technical trade-off, and how you measured success.' }]
+    }), [10, 22, 12, 34, 72, 105])
     XLSX.writeFile(workbook, `verity-screening-report-${new Date().toISOString().slice(0, 10)}.xlsx`, { compression: true })
     setToast('Excel screening workbook downloaded'); setTimeout(() => setToast(''), 3500)
   }
