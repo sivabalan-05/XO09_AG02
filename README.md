@@ -244,33 +244,8 @@ Transposing the matrix asks a different question: not *"is this candidate good e
 
 ---
 
-## 12. Run it
 
-No third-party dependencies. Python 3.10+.
-
-```bash
-python3 run.py
-```
-
-```bash
-python3 tests/test_adversarial.py
-```
-
-```bash
-python3 run.py --candidate A-01
-```
-
-`run.py` writes `out/report.html` and `out/assessments.json`. The eval suite runs **50 assertions — one per engineered trap — and all 50 pass.**
-
-The `anthropic` SDK is needed only for the optional refinement layer:
-
-```bash
-python3 run.py --llm
-```
-
----
-
-## 13. Full results
+## 12. Full results
 
 Twelve applications, each built to defeat one specific naive-matcher assumption.
 
@@ -307,7 +282,7 @@ A-12  near_miss                0.66   0.83   1.00  0.10   76%   advance
 
 ---
 
-## 14. Constraint compliance
+## 13. Constraint compliance
 
 | Constraint from the problem statement | How it is enforced |
 |---|---|
@@ -319,7 +294,7 @@ A-12  near_miss                0.66   0.83   1.00  0.10   76%   advance
 
 ---
 
-## 15. Architecture
+## 14. Architecture
 
 ```
 data/requisition.json          5 required + 4 preferred criteria + 1 hard constraint
