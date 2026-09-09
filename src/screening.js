@@ -6,6 +6,15 @@ const quantified = /\b\d+(?:[.,]\d+)?(?:k|m|%|ms|s| minutes?| hours?| days?| ser
 const productionWords = /\b(production|customer|enterprise|on-call|incident|sla|uptime|live|monthly users|per day)\b/i
 const caveatWords = /\b(no |not |haven't|have not|did not|without|only read|course|coursework|toy|sample|guided|shadow|assisted|academic|simulated|personal project)\b/i
 
+function meetsTenKRequestScale(text) {
+  const matches = [...text.matchAll(/\b(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?k)\s*(?:rps|requests?\s+(?:per\s+)?(?:second|sec))\b/ig)]
+  return matches.some((match) => {
+    const raw = match[1].toLowerCase()
+    const value = raw.endsWith('k') ? Number(raw.slice(0, -1)) * 1000 : Number(raw.replaceAll(',', ''))
+    return value >= 10000
+  })
+}
+
 export function splitEvidence(text) {
   return text
     .split(/\n|(?<=[.!?])\s+/)
@@ -69,7 +78,7 @@ function assessCriterion(text, criterion) {
   }
 
   if (criterion.id === 'multiregion') {
-    const scaleMet = /(?:10k|10,000|10000)\s+(?:rps|requests)/i.test(text)
+    const scaleMet = meetsTenKRequestScale(text)
     const leadMet = /\b(led|owned|architected)\b/i.test(matched.map((x) => x.line).join(' '))
     const prodMet = matched.some((x) => productionWords.test(x.line))
     if (!(scaleMet && leadMet && prodMet)) {

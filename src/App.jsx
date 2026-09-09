@@ -277,7 +277,18 @@ async function extractFileText(file) {
     const pages = []
     for (let i = 1; i <= pdf.numPages; i++) {
       const content = await (await pdf.getPage(i)).getTextContent()
-      pages.push(content.items.map((item) => (item.str || '') + (item.hasEOL ? '\n' : ' ')).join(''))
+      // PDF text items are often emitted in drawing order, which can separate a
+      // bullet's action from its technology/outcome. Rebuild visual rows first.
+      const rows = []
+      for (const item of content.items) {
+        if (!item.str?.trim()) continue
+        const x = item.transform?.[4] ?? 0
+        const y = item.transform?.[5] ?? rows.length
+        let row = rows.find((entry) => Math.abs(entry.y - y) < 2)
+        if (!row) { row = { y, parts: [] }; rows.push(row) }
+        row.parts.push({ x, text: item.str })
+      }
+      pages.push(rows.sort((a, b) => b.y - a.y).map((row) => row.parts.sort((a, b) => a.x - b.x).map((part) => part.text).join(' ')).join('\n'))
     }
     return pages.join('\n')
   }
@@ -309,8 +320,10 @@ function UploadModal({ onClose, onAdd, candidateCount }) {
         const fileText = await extractFileText(file)
         if (!fileText.trim()) throw new Error(`${file.name}: no readable text found. Paste the resume text to evaluate a scanned document.`)
         const fallback = file.name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ')
-        const firstLine = fileText.split('\n').find((line) => line.trim().length > 2)?.trim()
-        candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: (files.length === 1 && name.trim()) || firstLine?.slice(0, 45) || fallback, role: 'New applicant', source: 'Upload', expectedSalaryLpa: salary === '' ? undefined : Number(salary), text: fileText + (text.trim() ? `\n\nCOVER NOTE\n${text.trim()}` : '') })
+        const lines = fileText.split('\n').map((line) => line.trim()).filter(Boolean)
+        const nameLine = lines.find((line) => /^(?:[A-Z][a-z]{1,30}\s+){1,3}[A-Z][a-z]{1,30}$/.test(line))
+        const firstLine = lines.find((line) => line.length > 2)
+        candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: (files.length === 1 && name.trim()) || nameLine || firstLine?.slice(0, 45) || fallback, role: 'New applicant', source: 'Upload', expectedSalaryLpa: salary === '' ? undefined : Number(salary), text: fileText + (text.trim() ? `\n\nCOVER NOTE\n${text.trim()}` : '') })
       }
       if (text.trim() && !files.length) candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: name.trim() || 'Pasted applicant', role: 'New applicant', source: 'Pasted text', expectedSalaryLpa: salary === '' ? undefined : Number(salary), text })
       onAdd(candidates)
