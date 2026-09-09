@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 import { defaultRequisition, sampleCandidates } from './data'
 import { getPoolInsights, levelLabels, screenPool } from './screening'
+import { runBrowserLangChain } from './browserAgent'
 
 const views = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
@@ -27,19 +28,6 @@ function LevelPill({ level, compact = false }) {
 
 const STORAGE = { candidates: 'verity:candidates:v2', requisition: 'verity:requisition:v2' }
 const AGENT_API = import.meta.env.VITE_AGENT_API_URL || 'http://127.0.0.1:8787'
-const localAgentFallback = (candidate) => {
-  const recommendation = candidate.flags.some((flag) => flag.kind === 'contradictory')
-    ? 'Hold for human validation'
-    : candidate.requiredStrong >= 3 ? 'Shortlist for recruiter review' : 'Keep in reviewed pool'
-  return {
-    mode: 'local-policy-fallback', recommendation, narrative: null, modelStatus: 'Agent API unavailable — deterministic local policy used.',
-    trace: [
-      { step: 'Application intake', status: 'complete', detail: 'Source application retained in this browser.' },
-      { step: 'Evidence & contradiction review', status: 'complete', detail: `${candidate.assessments.length} criteria assessed; ${candidate.flags.length} claim check(s) cited.` },
-      { step: 'Human-review decision', status: 'complete', detail: `${recommendation}. This is not an automated hiring decision.` },
-    ],
-  }
-}
 function readStored(key, fallback) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback } catch { return fallback }
 }
@@ -242,7 +230,7 @@ function CandidateDetail({ candidate, requisition, onClose, onRemove, onVerify, 
       <div className="detail-body">
         {tab === 'assessment' ? <>
           <section className="claim-checks" aria-label="Contradiction and unsupported claim checks">
-            <div className="agent-status-card"><Bot size={18} /><div><strong>{candidate.agentReview?.mode === 'local-policy-fallback' ? 'Local policy review completed' : `LangChain review ${candidate.agentReview ? 'completed' : 'available'}`}</strong><p>{candidate.agentReview?.recommendation || 'Run the agent to create an auditable execution trace and a human-review recommendation.'}</p>{candidate.agentReview?.narrative && <small>{candidate.agentReview.narrative}</small>}{candidate.agentReview?.modelStatus && <small>{candidate.agentReview.modelStatus}</small>}</div><button className="secondary-button" onClick={onRunAgent}>{candidate.agentReview ? 'Run again' : 'Run agent'}</button></div>
+            <div className="agent-status-card"><Bot size={18} /><div><strong>LangChain review {candidate.agentReview ? 'completed' : 'available'}</strong><p>{candidate.agentReview?.recommendation || 'Run the agent to create an auditable execution trace and a human-review recommendation.'}</p>{candidate.agentReview?.narrative && <small>{candidate.agentReview.narrative}</small>}{candidate.agentReview?.modelStatus && <small>{candidate.agentReview.modelStatus}</small>}</div><button className="secondary-button" onClick={onRunAgent}>{candidate.agentReview ? 'Run again' : 'Run agent'}</button></div>
             {candidate.verification && <div className="verification-mini"><ShieldCheck size={16} /><span><strong>External evidence:</strong> {Object.values(candidate.verification).filter(Boolean).map((item) => `${item.provider} · ${item.status}`).join(' · ') || 'No verified source'}</span><button onClick={onVerify}>Review</button></div>}
             <h3>Application consistency · {candidate.flags.length} flag{candidate.flags.length === 1 ? '' : 's'}</h3>
             <p className="checks-explanation">{candidate.flags.length ? `Confidence reduced by ${candidate.confidenceReduction} percentage points. These checks identify conflicts or missing support, not dishonesty. Percentages are heuristic indicators, not calibrated probabilities.` : 'No conflict detected by the available checks. This does not verify every claim in the application.'}</p>
@@ -466,10 +454,10 @@ export default function App() {
         if (!response.ok) throw new Error('Agent service returned an error')
         review = await response.json()
         review.mode = 'langchain-api'
-      } catch { review = localAgentFallback(candidate) }
+      } catch { review = await runBrowserLangChain(candidate) }
       setCandidates((current) => current.map((item) => item.id === candidate.id ? { ...item, agentReview: review } : item))
       setActiveCandidate((current) => current?.id === candidate.id ? { ...current, agentReview: review } : current)
-      setToast(`${review.mode === 'langchain-api' ? 'LangChain' : 'Local evidence-policy'} review completed for ${candidate.name}`); setTimeout(() => setToast(''), 3500)
+      setToast(`LangChain review completed for ${candidate.name}`); setTimeout(() => setToast(''), 3500)
     } catch (error) { setToast(error.message); setTimeout(() => setToast(''), 5000) }
     finally { setAgentBusy('') }
   }
