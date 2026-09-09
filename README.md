@@ -319,25 +319,6 @@ A-12  near_miss                0.66   0.83   1.00  0.10   76%   advance
 
 ---
 
-## 15. Questions you will be asked
-
-**"Isn't this just an LLM call?"**
-No. Span indexing, timeline arithmetic, ontology traversal, Pareto computation, gap analysis and citation validation are all plain Python. Those are facts, not judgements — a model would only add variance and cost. The LLM layer runs only on the residual: phrases the curated ontology could not resolve.
-
-**"How do you know it isn't hallucinating?"**
-Every statement carries span IDs that are re-verified verbatim against the source after the run, and a negative control in the test suite proves the guard rejects invented text.
-
-**"What if a candidate just words things differently?"**
-That is A-02. He never writes "Kubernetes" and still meets the requirement in full, via a typed `implies` edge that the report names explicitly.
-
-**"Why not one score? It's easier to sort."**
-Because A-11 would disappear. High fit, low confidence is a real and common state, and one number cannot express it.
-
-**"How do you know it works?"**
-Every candidate is an engineered adversarial test case, and the suite asserts each specific trap fires: 50 assertions, all passing.
-
----
-
 ## 16. Architecture
 
 ```
