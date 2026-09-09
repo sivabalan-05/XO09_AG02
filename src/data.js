@@ -4,6 +4,11 @@ export const defaultRequisition = {
   title: 'Junior Platform Engineer',
   team: 'Infrastructure · Bengaluru / Remote',
   description: 'Join a small platform team building reliable developer infrastructure. We value demonstrated learning and hands-on ownership over keyword-perfect resumes.',
+  constraints: {
+    minExperienceYears: 0,
+    maxSalaryLpa: null,
+    seniority: 'junior',
+  },
   criteria: [
     {
       id: 'backend',
