@@ -319,7 +319,7 @@ A-12  near_miss                0.66   0.83   1.00  0.10   76%   advance
 
 ---
 
-## 16. Architecture
+## 15. Architecture
 
 ```
 data/requisition.json          5 required + 4 preferred criteria + 1 hard constraint
