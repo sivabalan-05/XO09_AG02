@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import * as XLSX from 'xlsx'
 import {
   AlertCircle, ArrowLeft, ArrowRight, BarChart3, Check, CheckCircle2, ChevronDown,
   CircleHelp, CloudUpload, FileText, Filter, LayoutDashboard, Menu, Pencil, Plus,
@@ -449,14 +450,39 @@ export default function App() {
     setCandidates((current) => current.filter((item) => item.id !== id)); setSelected((current) => current.filter((item) => item !== id)); setActiveCandidate(null); setToast(`${candidate.name} removed from this device`); setTimeout(() => setToast(''), 3500)
   }
   const exportReport = () => {
-    const report = {
-      generatedAt: new Date().toISOString(), requisition,
-      summary: { applicants: screened.length, strongMatches: screened.filter((c) => ['Leading match', 'Strong match'].includes(c.band)).length, claimChecks: screened.reduce((total, c) => total + c.flags.length, 0), poolGaps: insights.filter((i) => i.isGap).map((i) => i.name) },
-      candidates: screened.map(({ text, ...candidate }) => candidate),
+    const workbook = XLSX.utils.book_new()
+    const fullMatchById = new Map(requisitionAnalysis.candidates.map((item) => [item.candidate.id, item]))
+    const addSheet = (name, rows, widths) => {
+      const sheet = XLSX.utils.json_to_sheet(rows)
+      sheet['!cols'] = widths.map((width) => ({ wch: width }))
+      XLSX.utils.book_append_sheet(workbook, sheet, name)
     }
-    const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }))
-    const link = document.createElement('a'); link.href = url; link.download = 'verity-screening-report.json'; link.click(); URL.revokeObjectURL(url)
-    setToast('Screening report downloaded'); setTimeout(() => setToast(''), 3500)
+    addSheet('Summary', [
+      { Metric: 'Generated at', Value: new Date().toLocaleString() },
+      { Metric: 'Requisition', Value: requisition.title },
+      { Metric: 'Applicants analyzed', Value: screened.length },
+      { Metric: 'Strong matches', Value: screened.filter((candidate) => ['Leading match', 'Strong match'].includes(candidate.band)).length },
+      { Metric: 'Claim checks', Value: screened.reduce((total, candidate) => total + candidate.flags.length, 0) },
+      { Metric: 'Full requisition matches', Value: requisitionAnalysis.fullMatches.length },
+      { Metric: 'Shortlisting safeguard', Value: requisitionAnalysis.noFullMatch ? 'No candidate fully satisfies all required criteria.' : 'At least one candidate fully satisfies all required criteria.' },
+      { Metric: 'Pool-wide gaps', Value: insights.filter((item) => item.isGap).map((item) => item.name).join('; ') || 'None' },
+    ], [28, 95])
+    addSheet('Shortlist', screened.map((candidate, index) => {
+      const match = fullMatchById.get(candidate.id)
+      return { Rank: index + 1, ID: candidate.id, Candidate: candidate.name, Role: candidate.role, 'Fit band': candidate.band, 'Required strong': `${candidate.requiredStrong}/${candidate.requiredTotal}`, 'Evidence coverage': `${candidate.evidenceCoverage}%`, 'Assessment confidence': `${candidate.confidence}%`, 'Full requisition match': match?.fullyMeets ? 'Yes' : 'No', Strengths: match?.strengths.join('; ') || candidate.strength, 'Visible trade-offs': match?.tradeoffs.join('; ') || candidate.tradeoff, 'Claim checks': candidate.flags.length }
+    }), [7, 10, 22, 24, 18, 16, 18, 22, 22, 46, 70, 13])
+    addSheet('Criterion evidence', screened.flatMap((candidate) => candidate.assessments.map((assessment) => ({
+      ID: candidate.id, Candidate: candidate.name, Criterion: requisition.criteria.find((criterion) => criterion.id === assessment.criterionId)?.name, Type: requisition.criteria.find((criterion) => criterion.id === assessment.criterionId)?.type, Assessment: levelLabels[assessment.level], Confidence: `${assessment.confidence}%`, 'Equivalent terms': assessment.terms.join(', '), 'Cited evidence': assessment.evidence.join(' | '), Rationale: assessment.reason,
+    }))), [10, 22, 34, 12, 19, 13, 28, 85, 68])
+    addSheet('Claim checks', screened.flatMap((candidate) => candidate.flags.map((flag) => ({
+      ID: candidate.id, Candidate: candidate.name, Flag: flag.kind.toUpperCase(), Rule: flag.rule, Claim: flag.claim.quote, 'Claim source': `${flag.claim.section}, line ${flag.claim.line}`, 'Evidence reviewed': flag.evidence.map((evidence) => evidence.quote).join(' | ') || 'No separate supporting passage found', Assessment: flag.assessment,
+    }))), [10, 22, 20, 22, 58, 25, 85, 75])
+    addSheet('Requisition analysis', [
+      ...requisitionAnalysis.conflicts.map((conflict) => ({ Category: 'Conflict / restriction', Requirement: conflict.title, Pool_coverage: '', Finding: conflict.detail })),
+      ...requisitionAnalysis.requirementCoverage.map((item) => ({ Category: item.type === 'constraint' ? 'Constraint coverage' : 'Required criterion coverage', Requirement: item.name, Pool_coverage: `${item.met}/${item.total} (${item.coverage}%)`, Finding: item.met === 0 ? 'No candidate has supported evidence / meets this requirement.' : 'See Shortlist for trade-offs.' })),
+    ], [28, 42, 24, 95])
+    XLSX.writeFile(workbook, `verity-screening-report-${new Date().toISOString().slice(0, 10)}.xlsx`, { compression: true })
+    setToast('Excel screening workbook downloaded'); setTimeout(() => setToast(''), 3500)
   }
   const addCandidates = (newCandidates) => {
     setCandidates((current) => [...current, ...newCandidates]); setShowUpload(false); setView('candidates'); setToast(`${newCandidates.length} application${newCandidates.length > 1 ? 's' : ''} screened successfully`); setTimeout(() => setToast(''), 3500)
