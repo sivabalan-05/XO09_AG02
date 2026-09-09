@@ -1,0 +1,15 @@
+Priya Nair
+Associate Backend Engineer — 2 years
+
+EXPERIENCE
+• Built Python APIs for a subscription platform used by 8,000 monthly customers.
+• Introduced an event-driven order worker with Amazon SQS and idempotent retries, reducing failed jobs by 36%.
+• Containerized the service with Docker and deployed it to AWS ECS through a GitHub Actions pipeline.
+• Added structured logging, CloudWatch dashboards, and on-call alerts; resolved two production incidents.
+• Wrote deployment runbooks and partnered with the product team on releases.
+
+PROJECTS
+Used Terraform to create a repeatable AWS staging environment.
+
+COVER NOTE
+I have not worked on multi-region failover, but I want to grow into platform ownership.
