@@ -114,3 +114,8 @@ export const sampleCandidates = [
     text: `Om Prakash\nDevOps Trainee\n\nBOOTCAMP PROJECT\n• Deployed a sample Node.js store to Kubernetes on AWS EKS using Terraform.\n• Configured Prometheus metrics, Grafana dashboards and an alert for high error rate.\n• Used a RabbitMQ worker for email processing and documented setup steps for the cohort.\n• Load-tested the application at 300 requests per second.\n\nCERTIFICATIONS\nCKA, AWS Cloud Practitioner.\n\nCOVER NOTE\nThis was a guided eight-week team project, not production employment.`,
   },
 ]
+
+// Demo-only candidate-provided salary expectations for testing a requisition cap.
+// Absence remains distinct from meeting a cap in the screening agent.
+const demoSalaryLpa = { 'A-01': 9, 'A-02': 7, 'A-03': 8, 'A-04': 6, 'A-05': 10, 'A-06': 8, 'A-07': 7, 'A-08': 14, 'A-09': 7, 'A-10': 9, 'A-11': 8, 'A-12': 6, 'A-13': 8, 'A-14': 7, 'A-15': 6 }
+sampleCandidates.forEach((candidate) => { candidate.expectedSalaryLpa = demoSalaryLpa[candidate.id] })

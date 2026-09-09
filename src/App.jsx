@@ -292,6 +292,7 @@ function UploadModal({ onClose, onAdd, candidateCount }) {
   const [files, setFiles] = useState([])
   const [text, setText] = useState('')
   const [name, setName] = useState('')
+  const [salary, setSalary] = useState('')
   const [dragging, setDragging] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -309,9 +310,9 @@ function UploadModal({ onClose, onAdd, candidateCount }) {
         if (!fileText.trim()) throw new Error(`${file.name}: no readable text found. Paste the resume text to evaluate a scanned document.`)
         const fallback = file.name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ')
         const firstLine = fileText.split('\n').find((line) => line.trim().length > 2)?.trim()
-        candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: (files.length === 1 && name.trim()) || firstLine?.slice(0, 45) || fallback, role: 'New applicant', source: 'Upload', text: fileText + (text.trim() ? `\n\nCOVER NOTE\n${text.trim()}` : '') })
+        candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: (files.length === 1 && name.trim()) || firstLine?.slice(0, 45) || fallback, role: 'New applicant', source: 'Upload', expectedSalaryLpa: salary === '' ? undefined : Number(salary), text: fileText + (text.trim() ? `\n\nCOVER NOTE\n${text.trim()}` : '') })
       }
-      if (text.trim() && !files.length) candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: name.trim() || 'Pasted applicant', role: 'New applicant', source: 'Pasted text', text })
+      if (text.trim() && !files.length) candidates.push({ id: `A-${String(candidateCount + candidates.length + 1).padStart(2, '0')}`, name: name.trim() || 'Pasted applicant', role: 'New applicant', source: 'Pasted text', expectedSalaryLpa: salary === '' ? undefined : Number(salary), text })
       onAdd(candidates)
     } catch (err) { setError(err.message || 'Could not read that application.'); setBusy(false) }
   }
@@ -324,7 +325,7 @@ function UploadModal({ onClose, onAdd, candidateCount }) {
         </button>
         {files.length > 0 && <div className="file-list">{files.map((file, i) => <div key={`${file.name}-${i}`}><FileText size={16} /><span>{file.name}<small>{Math.max(1, Math.round(file.size / 1024))} KB</small></span><button onClick={() => setFiles(files.filter((_, idx) => idx !== i))}><X size={15} /></button></div>)}</div>}
         <div className="or"><span>or paste application text</span></div>
-        <label className="field"><span>Candidate name <small>optional</small></span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Priya Nair" /></label>
+        <label className="field"><span>Candidate name <small>optional</small></span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Priya Nair" /></label><label className="field"><span>Candidate-provided salary expectation (₹ LPA) <small>optional · used only if requisition has a cap</small></span><input type="number" min="0" value={salary} onChange={(e) => setSalary(e.target.value)} placeholder="e.g. 8" /></label>
         <label className="field"><span>{files.length ? 'Cover note for the uploaded resume (optional)' : 'Resume + cover note'}</span><textarea value={text} onChange={(e) => setText(e.target.value)} placeholder={files.length ? 'Paste this applicant’s cover note to cross-check it against their resume…' : 'Paste the complete application here…'} rows={7} /></label>
         {error && <div className="form-error"><AlertCircle size={16} />{error}</div>}
       </div>
