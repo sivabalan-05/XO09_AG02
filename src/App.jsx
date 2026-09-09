@@ -3,6 +3,7 @@ import {
   AlertCircle, ArrowLeft, ArrowRight, BarChart3, Check, CheckCircle2, ChevronDown,
   CircleHelp, CloudUpload, FileText, Filter, LayoutDashboard, Menu, Pencil, Plus,
   Search, ShieldCheck, Sparkles, Target, Users, X, Zap, Download, RotateCcw, Trash2,
+  Bot, GitBranch, Link2, ExternalLink, ShieldAlert, Workflow,
 } from 'lucide-react'
 import { defaultRequisition, sampleCandidates } from './data'
 import { getPoolInsights, levelLabels, screenPool } from './screening'
@@ -11,6 +12,7 @@ const views = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
   { id: 'candidates', label: 'Candidates', icon: Users },
   { id: 'insights', label: 'Pool insights', icon: BarChart3 },
+  { id: 'agent', label: 'Agent operations', icon: Bot },
 ]
 
 function Avatar({ name, size = 'md' }) {
@@ -24,6 +26,7 @@ function LevelPill({ level, compact = false }) {
 }
 
 const STORAGE = { candidates: 'verity:candidates:v2', requisition: 'verity:requisition:v2' }
+const AGENT_API = import.meta.env.VITE_AGENT_API_URL || 'http://127.0.0.1:8787'
 function readStored(key, fallback) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback } catch { return fallback }
 }
@@ -211,7 +214,7 @@ function Insights({ insights, screened }) {
   )
 }
 
-function CandidateDetail({ candidate, requisition, onClose, onRemove }) {
+function CandidateDetail({ candidate, requisition, onClose, onRemove, onVerify, onRunAgent }) {
   const [tab, setTab] = useState('assessment')
   const [sourceLine, setSourceLine] = useState(null)
   const showSource = (reference) => { setSourceLine(reference.line); setTab('source') }
@@ -220,12 +223,14 @@ function CandidateDetail({ candidate, requisition, onClose, onRemove }) {
   }, [tab, sourceLine])
   return (
     <Modal onClose={onClose} wide>
-      <div className="detail-header"><button className="icon-button" onClick={onClose} aria-label="Close candidate assessment"><ArrowLeft size={20} /></button><div className="detail-person"><Avatar name={candidate.name} /><div><span className="overline">{candidate.id} · {candidate.source}</span><h2>{candidate.name}</h2><p>{candidate.role}</p></div></div><span className={`band ${candidate.band.toLowerCase().replaceAll(' ', '-')}`}>{candidate.band}</span><button className="icon-button remove-candidate" onClick={onRemove} aria-label={`Remove ${candidate.name}`} title="Remove from local pool"><Trash2 size={18} /></button><button className="icon-button close" onClick={onClose} aria-label="Close candidate assessment"><X size={20} /></button></div>
+      <div className="detail-header"><button className="icon-button" onClick={onClose} aria-label="Close candidate assessment"><ArrowLeft size={20} /></button><div className="detail-person"><Avatar name={candidate.name} /><div><span className="overline">{candidate.id} · {candidate.source}</span><h2>{candidate.name}</h2><p>{candidate.role}</p></div></div><span className={`band ${candidate.band.toLowerCase().replaceAll(' ', '-')}`}>{candidate.band}</span><button className="icon-button" onClick={onRunAgent} aria-label={`Run LangChain evidence review for ${candidate.name}`} title="Run LangChain evidence review"><Bot size={18} /></button><button className="icon-button" onClick={onVerify} aria-label={`Verify external evidence for ${candidate.name}`} title="Review consented external evidence"><ShieldCheck size={18} /></button><button className="icon-button remove-candidate" onClick={onRemove} aria-label={`Remove ${candidate.name}`} title="Remove from local pool"><Trash2 size={18} /></button><button className="icon-button close" onClick={onClose} aria-label="Close candidate assessment"><X size={20} /></button></div>
       <div className="detail-summary"><div><span>Required areas</span><strong>{candidate.requiredStrong} of {candidate.requiredTotal} strong</strong></div><div><span>Evidence coverage</span><strong>{candidate.evidenceCoverage}%</strong></div><div><span>Assessment confidence</span><strong>{candidate.confidence}%</strong></div><div className={candidate.unsupportedCount ? 'warn' : ''}><span>Unsupported claims</span><strong>{candidate.unsupportedCount}</strong></div></div>
       <div className="detail-tabs"><button className={tab === 'assessment' ? 'active' : ''} onClick={() => setTab('assessment')}>Criterion assessment</button><button className={tab === 'source' ? 'active' : ''} onClick={() => setTab('source')}>Source application</button></div>
       <div className="detail-body">
         {tab === 'assessment' ? <>
           <section className="claim-checks" aria-label="Contradiction and unsupported claim checks">
+            <div className="agent-status-card"><Bot size={18} /><div><strong>LangChain review {candidate.agentReview ? 'completed' : 'available'}</strong><p>{candidate.agentReview?.recommendation || 'Run the agent to create an auditable execution trace and a human-review recommendation.'}</p>{candidate.agentReview?.narrative && <small>{candidate.agentReview.narrative}</small>}</div><button className="secondary-button" onClick={onRunAgent}>{candidate.agentReview ? 'Run again' : 'Run agent'}</button></div>
+            {candidate.verification && <div className="verification-mini"><ShieldCheck size={16} /><span><strong>External evidence:</strong> {Object.values(candidate.verification).filter(Boolean).map((item) => `${item.provider} · ${item.status}`).join(' · ') || 'No verified source'}</span><button onClick={onVerify}>Review</button></div>}
             <h3>Application consistency · {candidate.flags.length} flag{candidate.flags.length === 1 ? '' : 's'}</h3>
             <p className="checks-explanation">{candidate.flags.length ? `Confidence reduced by ${candidate.confidenceReduction} percentage points. These checks identify conflicts or missing support, not dishonesty. Percentages are heuristic indicators, not calibrated probabilities.` : 'No conflict detected by the available checks. This does not verify every claim in the application.'}</p>
             {candidate.flags.map((flag) => <article className={`claim-flag ${flag.kind}`} key={flag.id}>
@@ -359,6 +364,39 @@ function HelpModal({ onClose }) {
   </Modal>
 }
 
+function VerificationModal({ candidate, requisition, onClose, onSave }) {
+  const [githubUrl, setGithubUrl] = useState(candidate.verification?.github?.profile?.url || '')
+  const [linkedinUrl, setLinkedinUrl] = useState(candidate.verification?.linkedin?.url || '')
+  const [linkedinText, setLinkedinText] = useState('')
+  const [githubResult, setGithubResult] = useState(candidate.verification?.github || null)
+  const [linkedinResult, setLinkedinResult] = useState(candidate.verification?.linkedin || null)
+  const [busy, setBusy] = useState('')
+  const [error, setError] = useState('')
+  const request = async (path, body) => {
+    const response = await fetch(`${AGENT_API}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).message || 'The verification service is unavailable. Start the app with npm run dev:full.')
+    return response.json()
+  }
+  const checkGitHub = async () => {
+    setBusy('github'); setError('')
+    try { const result = await request('/api/verify/github', { profileUrl: githubUrl, requisition }); setGithubResult(result); onSave({ github: result }) }
+    catch (err) { setError(err.message) } finally { setBusy('') }
+  }
+  const checkLinkedIn = async () => {
+    setBusy('linkedin'); setError('')
+    try { const result = await request('/api/verify/linkedin', { url: linkedinUrl, authorizedText: linkedinText, requisition }); setLinkedinResult(result); onSave({ linkedin: result }) }
+    catch (err) { setError(err.message) } finally { setBusy('') }
+  }
+  const renderResult = (result) => result && <div className={`provider-result ${result.status}`}><strong>{result.provider} · {result.status.replaceAll('-', ' ')}</strong><p>{result.message || result.disclaimer}</p>{result.profile && <p>Profile: <a href={result.profile.url} target="_blank" rel="noreferrer">@{result.profile.handle} <ExternalLink size={12} /></a> · {result.profile.publicRepos} public repos</p>}{result.evidence?.length > 0 && <ul>{result.evidence.slice(0, 4).map((item, index) => <li key={item.url || index}>{typeof item === 'string' ? item : <a href={item.url} target="_blank" rel="noreferrer">{item.name} · {item.language} <ExternalLink size={11} /></a>}</li>)}</ul>}{result.criteriaSignals?.length > 0 && <p><strong>Terminology signals to review:</strong> {[...new Set(result.criteriaSignals.map((signal) => signal.criterion))].join(', ')}. These are not proficiency scores.</p>}</div>
+  return <Modal onClose={onClose} wide label="External evidence review"><div className="modal-header"><div><span className="overline">CONSENT-BASED VERIFICATION</span><h2>External evidence review</h2><p>For {candidate.name}. Findings are separate from the application fit score until reviewed by a person.</p></div><button className="icon-button" onClick={onClose} aria-label="Close verification"><X size={20} /></button></div><div className="verification-body"><section className="provider-card"><div><GitBranch size={21} /><div><h3>GitHub public evidence</h3><p>Read-only public profile and repository metadata. It cannot prove authorship, skill level or employment.</p></div></div><label className="field"><span>Candidate-provided GitHub profile</span><input value={githubUrl} onChange={(event) => setGithubUrl(event.target.value)} placeholder="https://github.com/username" /></label><button className="secondary-button" disabled={busy === 'github'} onClick={checkGitHub}>{busy === 'github' ? 'Checking…' : 'Review public GitHub'}</button>{renderResult(githubResult)}</section><section className="provider-card"><div><Link2 size={21} /><div><h3>LinkedIn authorized evidence</h3><p>No profile scraping. Use a candidate-authorized export here, or replace this adapter with your organization’s approved LinkedIn integration.</p></div></div><label className="field"><span>Public profile link <small>optional</small></span><input value={linkedinUrl} onChange={(event) => setLinkedinUrl(event.target.value)} placeholder="https://www.linkedin.com/in/..." /></label><label className="field"><span>Candidate-authorized profile export</span><textarea rows={5} value={linkedinText} onChange={(event) => setLinkedinText(event.target.value)} placeholder="Paste experience or project text the candidate has authorized you to use…" /></label><button className="secondary-button" disabled={busy === 'linkedin'} onClick={checkLinkedIn}>{busy === 'linkedin' ? 'Comparing…' : 'Compare authorized export'}</button>{renderResult(linkedinResult)}</section>{error && <div className="form-error"><AlertCircle size={16} />{error}</div>}<div className="consent-note"><ShieldAlert size={18} /><p>Recruiter safeguard: never use protected characteristics, inferred identity, network connections, or private data in the fit assessment. These providers are evidence sources for human review—not automatic background checks.</p></div></div><div className="modal-footer"><button className="primary-button" onClick={onClose}>Done</button></div></Modal>
+}
+
+function AgentOperations({ screened, onOpen, onRun, busy }) {
+  const completed = screened.filter((candidate) => candidate.agentReview).length
+  const queued = screened.filter((candidate) => !candidate.agentReview).length
+  return <div className="page-content"><div className="section-heading"><div><span className="overline">LANGCHAIN ORCHESTRATION</span><h2>Autonomous, reviewable screening runs</h2><p>Every run follows a fixed evidence-first workflow; humans retain the hiring decision.</p></div><span className="audit-badge"><Workflow size={16} /> {completed} auditable runs</span></div><div className="agent-architecture"><article><span>01</span><h3>Intake node</h3><p>Retains resume and cover-note source text; no hidden enrichment.</p></article><article><span>02</span><h3>Evidence node</h3><p>Maps aliases, scores support, and cites contradictions.</p></article><article><span>03</span><h3>Policy node</h3><p>Produces a recruiter-review recommendation, not a hire/reject.</p></article><article><span>04</span><h3>Optional LLM node</h3><p>LangChain may create a grounded summary when an API key is configured.</p></article></div><section className="panel agent-run-panel"><div className="panel-heading"><div><h3>Run queue</h3><p>{queued} application{queued === 1 ? '' : 's'} have not yet been processed by the LangChain workflow.</p></div></div><div className="agent-run-list">{screened.map((candidate) => <article key={candidate.id}><Avatar name={candidate.name} size="sm" /><div><strong>{candidate.name}</strong><small>{candidate.agentReview?.recommendation || 'Ready for evidence-first agent review'}</small></div><span className={candidate.agentReview ? 'run-complete' : 'run-ready'}>{candidate.agentReview ? 'Completed' : 'Queued'}</span><button className="secondary-button" onClick={() => onRun(candidate)} disabled={busy === candidate.id}>{busy === candidate.id ? 'Running…' : candidate.agentReview ? 'Run again' : 'Run agent'}</button><button className="icon-button" onClick={() => onOpen(candidate)} aria-label={`Open ${candidate.name}`}><ArrowRight size={16} /></button></article>)}</div></section></div>
+}
+
 export default function App() {
   const [view, setView] = useState('overview')
   const [requisition, setRequisition] = useState(() => readStored(STORAGE.requisition, defaultRequisition))
@@ -371,6 +409,8 @@ export default function App() {
   const [toast, setToast] = useState('')
   const [showCompare, setShowCompare] = useState(false)
   const [showHelp, setShowHelp] = useState(false)
+  const [verificationCandidate, setVerificationCandidate] = useState(null)
+  const [agentBusy, setAgentBusy] = useState('')
   const [candidateFilter, setCandidateFilter] = useState('all')
   const screened = useMemo(() => screenPool(candidates, requisition), [candidates, requisition])
   const insights = useMemo(() => getPoolInsights(screened, requisition), [screened, requisition])
@@ -400,6 +440,22 @@ export default function App() {
   const addCandidates = (newCandidates) => {
     setCandidates((current) => [...current, ...newCandidates]); setShowUpload(false); setView('candidates'); setToast(`${newCandidates.length} application${newCandidates.length > 1 ? 's' : ''} screened successfully`); setTimeout(() => setToast(''), 3500)
   }
+  const saveVerification = (candidateId, update) => {
+    setCandidates((current) => current.map((candidate) => candidate.id === candidateId ? { ...candidate, verification: { ...candidate.verification, ...update } } : candidate))
+    setActiveCandidate((current) => current?.id === candidateId ? { ...current, verification: { ...current.verification, ...update } } : current)
+  }
+  const runAgent = async (candidate) => {
+    setAgentBusy(candidate.id)
+    try {
+      const response = await fetch(`${AGENT_API}/api/agent/screen`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ candidate, requisition }) })
+      if (!response.ok) throw new Error('The agent service is unavailable. Start the complete app with npm run dev:full.')
+      const review = await response.json()
+      setCandidates((current) => current.map((item) => item.id === candidate.id ? { ...item, agentReview: review } : item))
+      setActiveCandidate((current) => current?.id === candidate.id ? { ...current, agentReview: review } : current)
+      setToast(`LangChain review completed for ${candidate.name}`); setTimeout(() => setToast(''), 3500)
+    } catch (error) { setToast(error.message); setTimeout(() => setToast(''), 5000) }
+    finally { setAgentBusy('') }
+  }
   return (
     <div className="app-shell">
       <Sidebar view={view} setView={setView} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} />
@@ -408,11 +464,13 @@ export default function App() {
         {view === 'overview' && <Overview screened={screened} insights={insights} onOpen={setActiveCandidate} onNavigate={setView} onFilter={applyFilter} selected={selected} onSelect={selectCandidate} />}
         {view === 'candidates' && <Candidates screened={screened} onOpen={setActiveCandidate} selected={selected} onSelect={selectCandidate} filterMode={candidateFilter} clearFilter={() => setCandidateFilter('all')} />}
         {view === 'insights' && <Insights insights={insights} screened={screened} />}
+        {view === 'agent' && <AgentOperations screened={screened} onOpen={setActiveCandidate} onRun={runAgent} busy={agentBusy} />}
       </main>
       {showUpload && <UploadModal onClose={() => setShowUpload(false)} onAdd={addCandidates} candidateCount={candidates.length} />}
       {showEdit && <EditRequisition requisition={requisition} onClose={() => setShowEdit(false)} onSave={(next) => { setRequisition(next); setShowEdit(false); setToast('Requisition saved and applicant pool rescored'); setTimeout(() => setToast(''), 3500) }} />}
       {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
-      {activeCandidate && <CandidateDetail candidate={activeCandidate} requisition={requisition} onClose={() => setActiveCandidate(null)} onRemove={() => removeCandidate(activeCandidate.id)} />}
+      {activeCandidate && <CandidateDetail candidate={activeCandidate} requisition={requisition} onClose={() => setActiveCandidate(null)} onRemove={() => removeCandidate(activeCandidate.id)} onVerify={() => setVerificationCandidate(activeCandidate)} onRunAgent={() => runAgent(activeCandidate)} />}
+      {verificationCandidate && <VerificationModal candidate={verificationCandidate} requisition={requisition} onClose={() => setVerificationCandidate(null)} onSave={(update) => saveVerification(verificationCandidate.id, update)} />}
       {showCompare && <CompareModal candidates={selected.map((id) => screened.find((c) => c.id === id)).filter(Boolean)} requisition={requisition} onClose={() => setShowCompare(false)} onOpen={(candidate) => { setShowCompare(false); setActiveCandidate(candidate) }} />}
       <CompareTray selected={selected} screened={screened} onClear={() => setSelected([])} onOpen={setActiveCandidate} onCompare={() => setShowCompare(true)} />
       {toast && <div className="toast"><CheckCircle2 size={18} />{toast}</div>}

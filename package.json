@@ -5,19 +5,29 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:agent": "node server/index.js",
+    "dev:full": "concurrently -k \"npm:dev:agent\" \"npm:dev\"",
     "build": "vite build",
     "test": "node --test",
     "preview": "vite preview",
     "lint": "eslint ."
   },
   "dependencies": {
+    "@langchain/openai": "^1.5.11",
     "@vitejs/plugin-react": "latest",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "langchain": "^1.5.10",
     "lucide-react": "latest",
     "mammoth": "latest",
     "pdfjs-dist": "latest",
-    "vite": "latest",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "vite": "latest",
+    "zod": "^4.5.4"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "concurrently": "^10.0.5"
+  }
 }
