@@ -1,21 +1,17 @@
-const meetsLevel = (level) => ['strong', 'supported'].includes(level)
+import { analyzeExperienceText } from './candidateFacts.js'
 
-function documentedYears(candidate) {
-  const lines = candidate.text.split('\n').map((line) => line.trim()).filter(Boolean)
-  const claims = lines.flatMap((line) => {
-    if (/\b(education|degree|b\.?tech|university|college)\b/i.test(line)) return []
-    const explicitExperience = [...line.matchAll(/\b(\d+(?:\.\d+)?)\+?\s+years?(?:\s+of)?\s+(?:professional\s+|industry\s+|software\s+|platform\s+)?experience\b/ig)].map((match) => Number(match[1]))
-    const roleHeader = [...line.matchAll(/(?:—|-)\s*(\d+(?:\.\d+)?)\+?\s+years?\b/ig)].map((match) => Number(match[1]))
-    return [...explicitExperience, ...roleHeader]
-  })
-  return claims.length ? Math.max(...claims) : null
-}
+const meetsLevel = (level) => ['strong', 'supported'].includes(level)
 
 function constraintEvaluation(candidate, constraints) {
   const results = []
   if (constraints.minExperienceYears > 0) {
-    const years = documentedYears(candidate)
-    results.push({ id: 'experience', name: `${constraints.minExperienceYears}+ years experience`, value: years, meets: years !== null && years >= constraints.minExperienceYears, known: years !== null, tradeoff: years === null ? 'No documented total-experience duration' : `${years} documented years vs ${constraints.minExperienceYears}+ required` })
+    const experience = analyzeExperienceText(candidate.text)
+    const durationFlag = candidate.flags?.some((flag) => ['duration', 'duration-conflict'].includes(flag.rule))
+    const years = durationFlag ? experience.timelineYears : experience.supportedYears
+    const description = years === null
+      ? (experience.claimedYears === null ? 'No supported total-experience duration' : `${experience.claimedYears} years claimed without separate supporting work evidence`)
+      : `${years} supported years vs ${constraints.minExperienceYears}+ required`
+    results.push({ id: 'experience', name: `${constraints.minExperienceYears}+ years experience`, value: years, meets: years !== null && years >= constraints.minExperienceYears, known: years !== null, tradeoff: description })
   }
   if (Number.isFinite(constraints.maxSalaryLpa)) {
     const salary = candidate.expectedSalaryLpa

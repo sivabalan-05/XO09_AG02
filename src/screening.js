@@ -29,7 +29,7 @@ function hitsFor(line, aliases) {
 function assessCriterion(text, criterion) {
   const lines = splitEvidence(text)
   const matched = lines
-    .map((line) => ({ line, aliases: hitsFor(line, criterion.aliases) }))
+    .map((line) => ({ line, aliases: hitsFor(line, criterion.aliases || []) }))
     .filter((item) => item.aliases.length)
 
   if (!matched.length) {

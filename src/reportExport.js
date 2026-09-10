@@ -1,4 +1,5 @@
 import { levelLabels } from './screening.js'
+import { candidateExperienceSources, compareSalary, experienceStatusLabel } from './candidateFacts.js'
 
 // Spreadsheet applications interpret leading =, +, -, and @ as formulas. Resume
 // text is untrusted input, so neutralize those prefixes before exporting it.
@@ -111,6 +112,28 @@ export function buildReportSheets({ screened, requisition, insights, requisition
       'Recruiter note': source.disclaimer || source.message || 'Review evidence manually before relying on it.',
     }))
   }), [10, 22, 16, 25, 52, 58, 100])
+
+  addSheet('Compensation & experience', screened.map((candidate) => {
+    const salary = compareSalary(candidate, requisition)
+    const experience = candidateExperienceSources(candidate, requisition)
+    return {
+      ID: candidate.id,
+      Candidate: candidate.name,
+      'Job salary ceiling (₹ LPA)': salary.cap ?? 'Not set',
+      'Expected salary (₹ LPA)': salary.expected ?? 'Not provided',
+      'Salary difference (₹ LPA)': salary.delta ?? 'Not comparable',
+      'Salary assessment': salary.label,
+      'Job minimum experience': experience.minimum ? `${experience.minimum}+ years` : 'Not set',
+      'Résumé claimed experience': experience.resume.claimedYears ?? 'Not stated',
+      'Résumé dated timeline': experience.resume.timelineYears ?? 'No dated timeline',
+      'Résumé supported experience': experience.resume.supportedYears ?? 'Not established',
+      'Résumé verification status': experienceStatusLabel(experience.resume.status),
+      'LinkedIn verification status': experience.linkedin ? experienceStatusLabel(experience.linkedin.status) : 'Not reviewed',
+      'LinkedIn supported experience': experience.linkedin?.supportedYears ?? 'Not established',
+      'GitHub observed activity span': experience.github ? `${experience.github.spanYears} years` : 'Not reviewed',
+      'GitHub recruiter note': 'Public repository activity is not proof of employment, professional tenure, authorship, or identity.',
+    }
+  }), [10, 22, 22, 22, 23, 42, 24, 24, 24, 27, 28, 28, 28, 28, 80])
 
   addSheet('Agent reviews', screened.map((candidate) => candidate.agentReview ? {
     ID: candidate.id,

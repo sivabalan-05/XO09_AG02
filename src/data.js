@@ -1,6 +1,9 @@
 import { contradictionSamples } from './contradictionSamples.js'
 
 export const defaultRequisition = {
+  id: 'JR-2048',
+  status: 'active',
+  createdAt: '2026-09-08',
   title: 'Junior Platform Engineer',
   team: 'Infrastructure · Bengaluru / Remote',
   description: 'Join a small platform team building reliable developer infrastructure. We value demonstrated learning and hands-on ownership over keyword-perfect resumes.',

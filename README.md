@@ -1,320 +1,364 @@
-# Are You Winning Son
-### PS02 — Autonomous Talent-Acquisition Screening Agent
+# Verity — Evidence-first Hiring
+
+Verity screens job applicants against a requisition by reading what their application actually *proves*, not by counting keywords. It reads claims and evidence from separate places, cites every judgement back to an exact line of the source text, flags contradictions between what a candidate says in different places, and — when a recruiter confirms a public GitHub profile or provides an authorized LinkedIn export — cross-checks that evidence into the score too, always capped and always cited.
+
+It does not make a hiring decision. It produces a traceable, evidence-backed recommendation for a human recruiter to review.
+
+This document explains every part of the project: what each file does, the exact scoring math, every API route, every Excel sheet, and how a resume travels from upload to shortlist.
 
 ---
 
-## 1. What this actually does
+## Table of contents
 
-A recruiter has one job opening and twelve applications. Some candidates are padding. Some are describing the same skill in different words. Some are genuinely good but wrote a short CV.
-
-This system reads each application and answers one question before anything else:
-
-> **How much of this should I believe?**
-
-It then reports what each candidate can actually be trusted to do, shows the exact line of the resume behind every judgement, and flags requirements that *nobody* in the pool can satisfy.
+1. [Why](#why)
+2. [Quick start](#quick-start)
+3. [Architecture](#architecture)
+4. [Data model](#data-model)
+5. [The screening pipeline](#the-screening-pipeline)
+6. [Contradiction detection](#contradiction-detection)
+7. [Requisition analysis](#requisition-analysis)
+8. [External verification (GitHub / LinkedIn) & the confidence cross-check](#external-verification)
+9. [Resume upload & text extraction](#resume-upload--text-extraction)
+10. [LangChain agent](#langchain-agent)
+11. [Excel export](#excel-export)
+12. [Server API](#server-api)
+13. [UI component reference](#ui-component-reference)
+14. [File-by-file guide](#file-by-file-guide)
+15. [Testing](#testing)
+16. [Tooling & configuration](#tooling--configuration)
+17. [Safeguards & design principles](#safeguards--design-principles)
+18. [Known limitations](#known-limitations)
 
 ---
 
-## 2. Why the obvious approach fails
+## Why
 
-The obvious approach is to match keywords from the job description against the resume. Here is what that does to three of our candidates:
+A keyword matcher counts mentions. A mention is something a candidate wrote about themselves — it isn't proof. Verity separates the two:
 
-| Candidate | What a keyword matcher sees | What is actually true |
+| | Read from | Measures |
 |---|---|---|
-| **A-01** | "Kubernetes" ×3, "Distributed Systems" ×3 → **strong match** | Never touched either. The mentions are all in his own summary and skills list. |
-| **A-02** | The word "Kubernetes" appears **zero times** → **no match** | Ran a 40-service production container platform for three years. |
-| **A-03** | Modest wording, few buzzwords → **weak match** | Personally led a 140-service migration and cut cloud spend 38%. |
+| **Claim** | summary, skills list, cover note | How the candidate rates themselves |
+| **Evidence** | the entire application | What the document actually demonstrates |
 
-A keyword matcher gets **all three backwards.** It promotes the padder and rejects the two strongest candidates.
+Every criterion assessment quotes the exact resume passage behind it. Every contradiction flag cites both the claim and the conflicting passage. Nothing is asserted without a receipt.
 
-The reason is that it counts *mentions*. A mention is something the candidate wrote about themselves. It is not evidence.
+## Quick start
 
----
+```bash
+npm install
+npm run dev
+```
 
-## 3. The one idea
+Open the printed Vite URL (default `http://localhost:5173`). The app is fully functional client-only: resume parsing, scoring, contradiction detection, GitHub verification, and Excel export all run in the browser. State (candidates + requisition) persists to `localStorage` per browser/device — there is no database.
 
-**Never let a claim and its evidence live in the same place.**
+To also run the optional Express agent API (needed for the server-side LangChain path and for the GitHub/LinkedIn verification endpoints to go through a backend instead of directly from the browser):
 
-The system reads them separately, from different sections, using different code:
+```bash
+npm run dev:full
+```
 
-| | Read from | What it measures |
+For the optional LLM-grounded summary node, copy `.env.example` to `.env`:
+
+```
+OPENAI_API_KEY=       # enables the LangChain grounded-summary node; never exposed to the browser
+OPENAI_MODEL=gpt-4.1-mini
+AGENT_PORT=8787
+```
+
+Without a key, every deterministic stage still runs and the app is fully usable — the LLM node is pure enhancement, never a dependency.
+
+## Architecture
+
+```
+┌─────────────────────────────┐        ┌──────────────────────────┐
+│  Browser (React + Vite)      │        │  Express agent API        │
+│                              │  HTTP  │  (optional, npm run       │
+│  Upload → extract → screen  │◄──────►│  dev:agent / dev:full)     │
+│  → display → export         │        │                            │
+│                              │        │  /api/agent/screen         │
+│  Falls back to a client-side│        │  /api/verify/github        │
+│  LangChain workflow and      │        │  /api/verify/github/search │
+│  direct GitHub/LinkedIn      │        │  /api/verify/linkedin       │
+│  calls when the API isn't    │        │                            │
+│  running.                    │        │  → LangChain RunnableSeq   │
+└─────────────────────────────┘        │  → GitHub REST API          │
+              │                         └──────────────────────────┘
+              │ localStorage
+              ▼
+   verity:candidates:v2
+   verity:requisition:v2
+```
+
+The browser never *requires* the server. `App.jsx` always tries the API first (when `VITE_AGENT_API_URL` is set) and transparently falls back to doing the same work client-side (`src/browserAgent.js`, or calling `agent/verifiers.js` functions directly) if the API call fails or isn't configured. Resume text never leaves the device unless the recruiter explicitly runs GitHub/LinkedIn verification (which only talks to GitHub's public API or compares candidate-authorized text — see [Safeguards](#safeguards--design-principles)).
+
+## Data model
+
+**Requisition** (`src/data.js` → `defaultRequisition`, editable in the UI via `EditRequisition`):
+
+```js
+{
+  title, team, description,
+  constraints: { minExperienceYears, maxSalaryLpa, seniority },
+  criteria: [
+    { id, name, type: 'required' | 'preferred', description, aliases: [...], stretch?: true }
+  ],
+}
+```
+
+The seeded requisition ("Junior Platform Engineer") has 7 criteria: 5 required (one, `multiregion`, marked `stretch: true` — a deliberately restrictive requirement) and 2 preferred (`iac`, `collaboration`).
+
+**Candidate** (as stored; `assessments`/`flags`/etc. are computed, not stored):
+
+```js
+{
+  id, name, role, source, text,               // raw application text
+  expectedSalaryLpa?,                          // optional, for the salary-cap constraint
+  agentReview?: { recommendation, trace, narrative, modelStatus, mode },
+  verification?: { github?: {...}, linkedin?: {...} },
+}
+```
+
+`screenCandidate(candidate, requisition)` (in `src/screening.js`) turns a raw candidate into a **scored candidate** by adding: `assessments` (per-criterion), `flags` (contradictions), `confidence`, `band`, `requiredStrong`, `requiredTotal`, `evidenceCoverage`, `unsupportedCount`, `strength`/`tradeoff` text, and more. The UI only ever renders scored candidates (the `screened` array in `App.jsx`, recomputed with `useMemo` whenever `candidates` or `requisition` changes).
+
+## The screening pipeline
+
+All of this lives in **`src/screening.js`**.
+
+**1. Split the resume into evidence lines** — `splitEvidence(text)` splits on newlines and sentence boundaries, strips bullet markers, and drops anything under 15 characters (too short to be meaningful evidence).
+
+**2. Match each criterion's aliases** — `hitsFor(line, aliases)` uses `containsTerm` (from `src/contradictions.js`) to do whole-word, plural-tolerant matching (e.g. "systems" also matches an alias ending in `system`).
+
+**3. Score each matching line** (`assessCriterion`) against five regexes:
+
+| Signal | What it looks for | Effect |
 |---|---|---|
-| **Claim** | summary, skills list, cover note **only** | How loudly you rate yourself |
-| **Evidence** | the entire application | What the document actually proves |
+| `claimWords` | expert, world-class, proficient, extensive, specialist… | self-rating language |
+| `evidenceWords` | built, deployed, operated, led, resolved, migrated… | an action verb |
+| `quantified` | a number with a unit — %, ms, users, requests, regions… | a measurable outcome |
+| `productionWords` | production, customer, enterprise, on-call, incident, sla, uptime… | a real operating context |
+| `caveatWords` | not, coursework, toy, guided, shadowed, academic, personal project… | weakens the line |
 
-Then it subtracts one from the other. That subtraction is the whole product.
+Score starts at 1; `+2` for an action verb, `+2` for a quantified outcome, `+1` for production context, `−2` for a caveat, `−1` if it's a bare self-rating with no action or metric. The **best-scoring line** for that criterion decides the level:
 
-```
-support_gap  =  asserted_level  −  supported_level
-```
+- **strong** — best score ≥ 5 *and* at least one non-caveated action line also has production context. Confidence: `78 + 4×(production examples) + 3×(metric examples)`, capped at 96.
+- **supported** — best score ≥ 3 with at least one action example. Confidence: `66 + 4×(action examples) + 3×(metric examples)`, capped at 88.
+- **claim-only** — a bare self-rating with no action/metric anywhere. Confidence 38.
+- **emerging** — anything else that matched (terminology present, but indirect/academic). Confidence 58.
+- **not-addressed** — no line matched any alias at all. Confidence 0.
 
-Everything else in this README is a consequence of that one decision.
+The **`multiregion`** criterion has a special rule on top: it also requires `meetsTenKRequestScale` (a ≥10,000 requests/sec figure, parsed from `\d{1,3}(?:,\d{3})+|\d+k` patterns) *and* an ownership verb (`led|owned|architected`) *and* a production-context line — otherwise the level is downgraded to `partial`/`claim-only`/`emerging` regardless of the base score, because "I helped with a multi-region migration" and "I led a multi-region migration serving 10k rps" are not the same claim.
 
----
+**4. Apply contradiction flags** — any criterion with a relevant flag (see next section) has its confidence cut by 15 points (further capped by the flag's own `confidenceCap`, 35 for a contradiction or 50 for an unsupported claim), and a `strong` level is downgraded to `supported` so a flagged claim can never read as the top tier.
 
-## 4. Watch it work — one resume, end to end
+**5. Apply the external-corroboration cross-check** — see [External verification](#external-verification) below. This runs *after* the contradiction step, so it can never paper over a real contradiction.
 
-Following **A-01**, the padder, through all nine stages. Every value below is real output, not an illustration.
+**6. Aggregate to a candidate score**:
+- `requiredStrong` / `requiredPartial` — counts of required criteria at `strong`/`supported` or `partial`/`emerging`.
+- `evidenceCoverage` — `Σ levelValue(assessment.level) / (4 × criteria count)`, as a percentage (`levelValue`: strong=4, supported=3, partial=2, emerging/claim-only=1, not-addressed/conflicting=0).
+- `confidence` — the mean confidence across every *addressed* criterion (not-addressed criteria are excluded so an empty resume can't look artificially confident), minus up to 20 points for pool-level contradiction flags not tied to a specific criterion.
+- `unadjustedConfidence` / `confidenceReduction` — the same mean *before* the contradiction penalty, so the UI can show exactly how many points a flag cost.
+- **band**: `Leading match` (4+ required-strong, zero unsupported claims, zero flags) → `Strong match` (3+ required-strong) → `Promising match` (2+ required-strong, or 4+ combined strong+partial) → `Developing match` (everything else).
 
-His cover note says:
+`screenPool(candidates, requisition)` maps every candidate through `screenCandidate` and sorts by band, then required-strong count, then evidence coverage.
 
-> *"I am an expert in distributed systems with deep expertise in Kubernetes at production scale."*
+`getPoolInsights(screened, requisition)` aggregates per-criterion across the whole pool: how many candidates are strong/partial/claim-only, coverage %, and whether it's a **pool-wide gap** (a required criterion zero candidates meet — flagged as a requisition problem, not a candidate failure).
 
-### Stage 1 — Split the document into citable spans
+## Contradiction detection
 
-Every sentence and bullet gets a permanent ID. This is what makes every later statement traceable.
+**`src/contradictions.js`** — pure text analysis, no model involved.
 
-```
-A-01:summary.1     [summary   ]  Expert in distributed systems and large-scale cloud architecture.
-A-01:summary.2     [summary   ]  Deep expertise in Kubernetes, service mesh design, and infrastructure automation.
-A-01:skills.1      [skills    ]  Kubernetes
-A-01:skills.5      [skills    ]  Distributed Systems
-A-01:education.2   [education ]  Coursework: CS-6210 Advanced Operating Systems, CS-6250 …, Distributed Systems Seminar
-A-01:cover_note.1  [cover_note]  I am an expert in distributed systems with deep expertise in Kubernetes…
-```
+- `sourcePassages(text)` splits the resume into addressable passages, each tagged with a section (SUMMARY, EXPERIENCE, COVER NOTE, etc., detected via a heading regex), a line number, and exact character offsets — this is what makes every flag's citation clickable back to the exact source line in the UI.
+- `dateBlocks(passages, now)` finds `YYYY–YYYY` / `YYYY–present` ranges (excluding the EDUCATION section) and computes generous year-only durations, merging overlapping ranges (`unionYears`) so two overlapping jobs don't double-count experience.
+- `detectContradictions(text, requisition, now)` produces flags for:
+  - **`duration-conflict`** — two passages state different explicit years-of-experience for the same skill, without one being a "professional" qualifier that would explain the gap.
+  - **`duration` (unsupported)** — a claimed duration (e.g. "5 years of Python") exceeds the total dated experience the resume actually documents for that skill, with a generous year-only tolerance.
+  - **`conflicting-passages`** — a positive claim and an explicit denial about the same skill/scope appear in different passages, with no time qualifier ("before", "since") that would resolve it.
+  - **`expertise` (unsupported)** — expertise language with matching criterion terms but zero action-verb evidence anywhere for that skill.
+  - **`title-scope`** — a senior/lead/principal title followed later (same section) by an explicit statement limiting ownership ("only shadowed", "did not lead").
+- Two intentional exclusions worth knowing: a `negation` regex is written to **not** match "rather than" (so "solid rather than exceptional" is read as a modesty qualifier, not a disclaimer — and is credited, not punished), and a time-qualified denial ("I had not worked with X *before* 2022") is never flagged, since a timeline-scoped statement isn't a contradiction.
 
-Notice the section label on each. It matters enormously and costs nothing.
+Every flag carries `kind` (`contradictory` or `unsupported`), the exact `claim` and `evidence` passages (with section/line/offsets), a plain-English `assessment`, and a `confidenceCap`.
 
-### Stage 2 — Extract claims, from assertion sections only
+## Requisition analysis
 
-```
-distributed_systems   asserted = expert      from A-01:summary.1
-kubernetes            asserted = expert      from A-01:summary.2
-kubernetes            asserted = expert      from A-01:cover_note.1
-```
+**`src/requisitionAnalysis.js`** — `analyzeRequisition(screened, requisition)`:
 
-The word "expert" is a **self-rating**. It is recorded as a claim, and it now has to be paid for.
+- `documentedYears(candidate)` extracts explicit "`N years… experience`" and role-header (`— N years`) durations from non-education lines, and takes the max.
+- **Structural conflicts** (shown before any shortlist): a junior-level role also requiring 5+ years' experience; a junior-level role also requiring a `stretch` criterion; an experience floor combined with a fixed salary cap (flagged as something the agent can't resolve — it can't infer market rates).
+- **Requirement coverage**: for every required criterion and for the experience/salary constraints (when set), how many candidates in the pool meet it.
+- **Per-candidate**: `unmetCriteria`, `unmetConstraints`, `strengths`, `fullyMeets` (zero unmet criteria *and* zero unmet constraints), `tradeoffs` (unmet criteria + unmet constraints + a note per claim-check flag).
+- **`shortlist`** — the top 5 candidates sorted by required-criteria met, then fewest trade-offs. This is what powers the "Closest-fit shortlist" panel on the Pool Insights page (and its own Excel sheet).
+- **`fullMatches`** / **`noFullMatch`** — whether anyone in the pool fully satisfies every required criterion and constraint; the UI shows this prominently as a shortlisting safeguard so no one assumes a "leading" candidate is automatically a full match.
 
-### Stage 3 — Harvest evidence, from the whole document, independently
+## External verification
 
-```
-distributed_systems   E0   A-01:summary.1      'distributed systems' in summary
-distributed_systems   E0   A-01:skills.5       'Distributed Systems' in skills
-distributed_systems   E1   A-01:education.2    'Distributed Systems' in education     ← the best he has
-distributed_systems   E0   A-01:cover_note.1   'distributed systems' in cover_note
+**`agent/verifiers.js`** (shared between the browser and the server — no duplicated logic):
 
-kubernetes            E0   A-01:summary.2      'Kubernetes' in summary
-kubernetes            E0   A-01:skills.1       'Kubernetes' in skills
-kubernetes            E0   A-01:cover_note.1   'Kubernetes' in cover_note              ← nothing above E0
-```
+- **`extractGithubUrl(text)` / `extractLinkedInUrl(text)`** — regex-scan the resume text for a `github.com/<handle>` or `linkedin.com/in/<slug>` reference (with or without the `https://` prefix), skipping known non-profile GitHub paths (`settings`, `topics`, `orgs`, etc.). This is checked automatically the moment a recruiter opens a candidate's verification panel — if the candidate wrote the link themselves, no one has to retype it.
+- **`verifyGitHubProfile(profileUrl, requisition)`** — resolves a handle (from a bare handle or a full URL), fetches the public profile and up to 8 non-fork repos (name, description, language, topics, update date) from the GitHub REST API, and computes `criteriaSignals`: which requisition criteria each repo's name/description/language/topics touch, tagged with `source: 'GitHub'`, the exact `repo` name, and its URL — so every signal is traceable to one specific repository.
+- **`searchGitHubProfiles(name)`** — the fallback when no link is in the resume: searches GitHub's public `/search/users` endpoint by the candidate's name (as the recruiter entered it) and returns candidate matches for the recruiter to look at. **It never auto-selects one** — the UI shows avatar + handle + a link, and only saves a profile when the recruiter clicks "Use this profile." This is a deliberate design choice: a common name could easily match a stranger, and the app's own safeguard is "never use... inferred identity."
+- **`verifyLinkedInEvidence({ url, authorizedText, requisition })`** — never scrapes. With no `authorizedText`, it returns `needs-authorized-export` (or `needs-consent` with no URL either) and stops there. Only when a recruiter pastes text the candidate authorized does it compute `criteriaSignals` the same way as GitHub.
 
-Three of his four "distributed systems" mentions are **him saying so**. Those are E0 — a bare self-assertion. The single real one is a line of coursework, which is E1.
+**The confidence cross-check** (`applyExternalCorroboration` in `src/screening.js`): when a candidate has verification signals, each matching criterion can be promoted **one step** up a fixed ladder (`not-addressed → claim-only → emerging → partial → supported → strong`), capped so it can **never reach `strong`** on external evidence alone, and confidence is raised to `min(80, confidence + 10)` (never lowered — `Math.max` against the original). A criterion already at `conflicting` is left untouched entirely — external evidence never overrides a resume contradiction. Every promoted assessment gets an `externalCorroboration` array (source, repo, repo URL, matched terms) and a `reason` suffix naming exactly which repo (or the LinkedIn export) backed the change — rendered in the UI under "Cross-checked against external evidence," and exported to Excel.
 
-For Kubernetes there is nothing at all above E0. He never describes doing it anywhere.
+## Resume upload & text extraction
 
-### Stage 4 — Subtract
+**`extractFileText(file)`** in `src/App.jsx`:
 
-```
-kubernetes            UNSUPPORTED   asserted=expert  supported=mentioned   gap = +4
-distributed_systems   UNSUPPORTED   asserted=expert  supported=familiar    gap = +3
-```
+- **`.txt` / `.md`** — read as-is.
+- **`.pdf`** — uses `pdfjs-dist` in the browser. Text items come out of the PDF in drawing order, which can separate a bullet's action from its outcome, so rows are reconstructed by grouping items with the same y-coordinate (within 2px) and sorting left-to-right within each row before sorting rows top-to-bottom. It also reads every page's **link annotations** (`page.getAnnotations()`) and appends their target URLs as a `LINKS` block at the end of the extracted text — this is what lets `extractGithubUrl`/`extractLinkedInUrl` find an icon-only hyperlink (no visible URL text, just a linked glyph) that plain text extraction would otherwise miss entirely.
+- **`.docx`** — `mammoth.extractRawText`.
 
-He is not rejected for lacking the words. He is downgraded because **the only thing backing the word is the word itself.**
+The upload modal (`UploadModal`) validates: only `.pdf/.docx/.txt/.md`, 10 MB per file, a cover note can only be attached to a *single* uploaded resume (so evidence never gets mixed between two candidates), pasted text has a 250,000-character cap, and the salary field must be blank or a non-negative number. The candidate's display name is auto-detected — from a name-shaped line in the file, or (for pasted text with no file) from the pasted text itself — the same `detectName` logic runs whichever path was used, so a pasted resume gets the candidate's real name instead of a generic placeholder.
 
-### Stages 5–9 in one line each
+## LangChain agent
 
-- **5. Criteria** — fails the Kubernetes requirement; `RequiredCoverage 0.00`
-- **6. Fit vector** — four separate numbers, no overall score
-- **7. Confidence** — 34%, driven down by how many of his own claims collapsed
-- **8. Trade-offs** — dominated by others, so not on the shortlist frontier
-- **9. Citations** — every statement above re-verified against his original file
+Two implementations of the same 3–4 node graph, so the feature works with or without the server running:
 
-**Result:** *do not advance* — with a receipt for every step.
+**Server-side** (`agent/orchestrator.js`, `createScreeningAgent`):
+1. **Application intake** — records how many source lines were retained.
+2. **Evidence & contradiction review** — runs `screenCandidate` and records how many criteria were assessed and how many claim checks were cited.
+3. **Human-review decision** — deterministic policy: any contradictory flag → "Hold for human validation"; 3+ required-strong → "Shortlist for recruiter review"; otherwise → "Keep in reviewed pool." **Never** emits a hire/reject decision.
+4. **Optional grounded-summary node** — only runs when `useModel` is true (`Boolean(process.env.OPENAI_API_KEY)` by default). Uses `ChatOpenAI` with `withStructuredOutput` to write a ≤500-character recruiter summary, explicitly instructed to use only the supplied evidence, never infer missing experience, never make a hiring decision, and name material trade-offs. If it errors, `modelStatus` records why and the deterministic recommendation is still returned unaffected.
 
----
+The result deliberately excludes the input candidate/requisition and the full recomputed assessment — only `{ recommendation, trace, narrative, modelStatus }` — so storing it on `candidate.agentReview` can't recursively nest the whole application into itself on every re-run.
 
-## 5. Watch it not make the opposite mistake — A-02
+**Browser-side fallback** (`src/browserAgent.js`, `runBrowserLangChain`) — the same 3-stage shape (intake → evidence review → policy), but works off the *already-computed* `candidate.assessments`/`flags` instead of recomputing them, and never sends anything over the network. `App.jsx`'s `runAgent` always tries the server API first (when configured) and falls back to this automatically on any failure.
 
-A-02's application contains the word "Kubernetes" **zero times.** A keyword matcher rejects him instantly. Here is what this system does:
+## Excel export
 
-```
-R1 (Kubernetes requirement)   met: True   best_tier: E4   coverage: 1.00
-route: AWS ECS / Fargate → kubernetes via implies (w=0.75), E4 → effective E4
-cited: A-02:exp.1.b1
-```
+**`src/reportExport.js`** — `downloadScreeningWorkbook(data)` builds a `.xlsx` via `exceljs`, client-side, and triggers a browser download. `safeSpreadsheetCell(value)` prefixes any string starting with `=`, `+`, `-`, or `@` with a `'` so untrusted resume text can never become a spreadsheet formula (`=HYPERLINK(...)` and similar) when opened in Excel/Sheets. Ten sheets, in order:
 
-That cited span reads:
+1. **Summary** — generated-at timestamp, requisition title, pool size, strong-match count, total claim checks, full-requisition-match count, the shortlisting safeguard sentence, and any pool-wide gaps.
+2. **Shortlist** — every candidate, ranked, with band, required-strong, evidence coverage, confidence, whether they fully match the requisition, strengths, trade-offs, and claim-check count.
+3. **Closest-fit shortlist** — the top-5 `requisitionAnalysis.shortlist`: rank, candidate, "required met" as `X/Y`, total applicants in the pool, strengths, trade-offs.
+4. **Criterion evidence** — one row per candidate × criterion: assessment level, confidence, recognized equivalent terms, cited evidence quotes, **external corroboration** (which repo, if any), and the rationale sentence.
+5. **Claim checks** — every contradiction/unsupported-claim flag: the claim, its exact source line, the evidence reviewed, and the assessment.
+6. **Requisition analysis** — structural conflicts plus coverage for every required criterion and constraint.
+7. **Criterion coverage** — every criterion in the requisition (including preferred ones, which sheet 6 excludes), with supported/partial/missing counts and a pool-wide-gap flag.
+8. **External evidence review** — every candidate's GitHub/LinkedIn verification status, source profile/URL, matched terminology signals, and a recruiter note.
+9. **Agent reviews** — the LangChain recommendation, mode, model status, narrative, and full execution trace per candidate ("Not yet run" for anyone who hasn't been processed).
+10. **Interview recommendations** — per shortlisted candidate, one suggested interview question per claim-check flag (priority: High), per unmet required criterion (Medium), and per unmet constraint (High) — or one general-depth question if nothing specific was flagged.
 
-> *"I led the migration of a 40-service monolith-to-microservices fleet onto ECS Fargate, cutting deploy time from 45 minutes to 6."*
+Every sheet has a frozen header row, alternating-row shading, autofilter, and a fallback "No records for this section" row so an empty sheet never renders as a blank, broken table.
 
-He **meets the requirement in full**, and the report names the exact route it used, so a human can audit the decision.
+## Server API
 
-**Why direction matters.** The ontology has three relation types, and `implies` is deliberately **one-way**:
+**`server/index.js`** — Express, CORS-enabled, 2 MB JSON body limit. All routes are stateless; nothing is persisted server-side.
 
-- `alias` — same thing, different name. K8s ≡ Kubernetes ≡ EKS.
-- `implies` — running production ECS/Fargate *implies* orchestration competence. **Kubernetes does not imply ECS.**
-- `adjacent` — neighbouring skill, partial credit only.
+| Route | Method | Body | Does |
+|---|---|---|---|
+| `/api/health` | GET | — | `{ ok, service, llmSummaryEnabled }` — whether `OPENAI_API_KEY` is set |
+| `/api/agent/screen` | POST | `{ candidate, requisition }` | Runs the full LangChain agent, returns the recommendation/trace/narrative |
+| `/api/verify/github` | POST | `{ profileUrl, requisition }` | Runs `verifyGitHubProfile` |
+| `/api/verify/github/search` | POST | `{ name }` | Runs `searchGitHubProfiles`, returns `{ results }` |
+| `/api/verify/linkedin` | POST | `{ url, authorizedText, requisition }` | Runs `verifyLinkedInEvidence` |
 
-If `implies` ran both directions, the system would start crediting people with experience they never claimed. That is the line between recognising equivalence and inventing it.
+`VITE_AGENT_API_URL` (unset by default) tells the client where to reach this API; with it unset, every one of these falls back to running the same logic directly in the browser.
 
----
+## UI component reference
 
-## 6. How evidence gets its tier
+All in **`src/App.jsx`** (612 lines, one file by design for a project this size):
 
-The tier comes from **where a span sits** and **what it demonstrates** — never from how confidently it is written.
-
-| Tier | Meaning | Example |
-|---|---|---|
-| **E4** | Production work with scope, ownership **and** an outcome | *"I led the migration of 140 services… zero downtime"* |
-| **E3** | Substantial project or professional work | *"I run the Kubernetes staging cluster"* |
-| **E2** | Academic project, certification, training | CKA, CKAD, a home lab |
-| **E1** | Coursework mention or stated familiarity | *"Coursework: … Distributed Systems Seminar"* |
-| **E0** | Bare keyword or self-assertion | `Kubernetes` in a skills list |
-
-Three adjustments, each recorded and cited:
-
-| Signal | Effect | Why |
-|---|---|---|
-| ownership **+** quantified outcome | **+1 tier** | You did it and you can say what happened |
-| "our team migrated…", "helped with…" | **−1 tier** | Real work, but your individual share is unclear |
-| "worked on", "responsible for", "exposure to" | **−2 tiers** | Describes proximity to work, not performance of it |
-
-> **A-07** wrote *"Our team migrated the estate to Kubernetes, scaling to 10 million users."* That is a genuine achievement, so it is not thrown away — but it drops to E2 and the requisition's personal-leadership constraint is marked unmet. The report says exactly why.
-
----
-
-## 7. Two distinctions most screeners get wrong
-
-**A disclaimer is not evidence.**
-A-12 writes *"I have not worked in a FedRAMP or GovCloud environment."* A naive matcher counts that as a FedRAMP hit. This system detects negation per clause and scores it as zero.
-
-**A modesty qualifier is not a disclaimer.**
-A-03 writes *"solid rather than exceptional."* That is not a statement of absence, and treating it as one would punish exactly the understated candidates worth finding. The negation detector deliberately excludes "rather than" — and there is a test asserting it.
-
-> **A-03's verdict: UNDERSTATED.** She rates herself *proficient*; her evidence supports *expert*. She is **credited upward, at the level her evidence supports.**
-
----
-
-## 8. Padding is caught by arithmetic, not by judgement
-
-*"6+ years of production Kubernetes"* reads perfectly fluently on a CV whose first job started 39 months ago. A language model reads straight past it. Date arithmetic never does — so the timeline checker is plain Python with no model involved.
-
-**A-05 was caught four independent ways:**
-
-| Check | Finding |
+| Component | Role |
 |---|---|
-| Total experience | Claims 8 years; his listed roles total **37 months** |
-| Skill years vs career | Claims 6 years of Kubernetes; entire career is **3.2 years** |
-| Technology anachronism | Claims Terraform **since 2012** — Terraform did not exist until **2014** |
-| Since-year vs career | Implies 14 years of use against a 3.2-year career |
+| `Avatar` | Deterministic-color initials badge from a candidate's name |
+| `LevelPill` | Colored pill for an assessment level |
+| `Modal` | Base modal: focus trap (Tab cycles within it), Escape to close, click-outside to close |
+| `Topbar` / `Sidebar` | App chrome — nav, help, export, add-applicants, mobile hamburger |
+| `RequisitionHeader` | Title, applicant/strong-match/claim-check counts, filter shortcuts |
+| `CandidateRow` | One row in any candidate list — click opens the detail modal, checkbox adds to compare |
+| `PoolGap` | Banner for a required criterion nobody meets |
+| `Overview` | Landing view — metric cards, pool gap, top-5 shortlist, trade-off cards |
+| `Candidates` | Full searchable/filterable candidate list |
+| `Insights` | Requisition health — shortlisting safeguard, structural conflicts, requirement coverage, closest-fit shortlist, pool gaps, per-criterion coverage bars |
+| `CandidateDetail` | The full evidence panel — criterion assessments (with external corroboration), claim checks, and a line-numbered source view that jumps to the cited line |
+| `UploadModal` | Add applicants — drag/drop files or paste text, with all the validation described above |
+| `EditRequisition` | Edit title, team, constraints, and every criterion's name/description/aliases |
+| `CompareModal` / `CompareTray` | Side-by-side trade-off comparison for up to 3 selected candidates |
+| `HelpModal` | "How the screening works" — the in-app explanation of every scoring stage, including the external cross-check |
+| `VerificationModal` | The GitHub/LinkedIn panel: auto-detects a resume link and verifies automatically, or searches by name with recruiter confirmation |
+| `AgentOperations` | LangChain run queue — one-click run/re-run per candidate, with the node graph explained |
+| `App` (default export) | Owns all state (`candidates`, `requisition`, `activeCandidateId`, etc.), derives `screened`/`insights`/`requisitionAnalysis` via `useMemo`, persists to `localStorage` |
 
-A `CONTRADICTED` verdict **overrides everything else**, however impressive the described work reads. And because his dates cannot be trusted, he is also removed from the pool's capacity count for every requirement.
+`activeCandidateId` (not a candidate snapshot) is the source of truth for which candidate's detail view is open — the actual candidate object is always looked up fresh from the live `screened` array, so a verification or agent-run update is reflected immediately without a stale, hand-patched copy drifting out of sync.
 
-**Zero false positives on the other eleven candidates.** A-09 claims fourteen years; his roles sum to exactly 168 months, and he passes clean.
-
----
-
-## 9. Why there is no single score
-
-Fit is **four independent numbers**, and confidence is reported **separately and never multiplied in**:
-
-`RequiredCoverage` · `EvidenceQuality` · `SeniorityMatch` · `TrajectoryRisk`
-
-That separation lets the system say two things a single score structurally cannot:
-
-> **A-11 — high fit, 57% confidence.** A one-page CV where every line is E4. He is not weak; there is simply less material to assess. **Low confidence describes the document, not the person.** Collapse these into one number and he silently drops below candidates who wrote more.
-
-> **A-09 — RequiredCoverage 0.84, SeniorityMatch 0.29.** Fourteen years against a 2–4 year band. Averaging would hide either his strength or his misfit. Keeping the axes apart shows both at once.
-
-**Shortlisting uses a Pareto frontier.** A candidate is on it when nobody else is at least as good on all four dimensions *and* better on one. Four survive — **A-02, A-03, A-09, A-11** — and the system states pairwise what actually differs instead of ranking them. Inside a tier, candidates are explicitly not ranked against each other.
-
----
-
-## 10. The agent cannot invent evidence
-
-Every statement carries span IDs. After the run, `validate.py` re-opens the original files and asserts each cited span **exists** and its text appears **verbatim**.
+## File-by-file guide
 
 ```
-Citation validation: 147 citations checked, ALL VERIFIED
+src/
+  App.jsx (612 lines)              Every UI component — see the table above
+  screening.js (248 lines)          Criterion scoring, contradiction-aware confidence,
+                                     external-corroboration cross-check, fit bands, pool sort
+  contradictions.js (109 lines)     Source-passage indexing + all contradiction/claim rules
+  requisitionAnalysis.js (59 lines) Requirement conflicts, pool feasibility, closest-fit shortlist
+  reportExport.js (175 lines)       The 10-sheet Excel workbook builder
+  browserAgent.js (44 lines)        Client-side LangChain fallback (no network)
+  data.js (121 lines)               Sample requisition + 12 hand-written demo candidates
+  contradictionSamples.js (39 lines) 3 more candidates engineered to trigger specific claim checks
+  main.jsx (10 lines)                React root
+
+agent/
+  orchestrator.js (86 lines)        Server-side LangChain agent (4-node RunnableSequence)
+  verifiers.js (95 lines)            GitHub/LinkedIn verification, link extraction, name search
+
+server/
+  index.js (35 lines)                Express API — see the routes table above
+
+tests/                              31 tests total — see Testing below
+sample-resumes/                     Example resumes for manual testing
+build_kabir_cv.py                   Generates one of the sample-resumes files (DOCX/PDF)
+AGENT_ARCHITECTURE.md               Earlier architecture note (agent graph + safeguards)
+design-system/verity/               Design-system reference notes from an earlier design pass
+.env.example                        OPENAI_API_KEY / OPENAI_MODEL / AGENT_PORT
+.claude/launch.json                 Browser-preview config for Claude Code (dev tooling only)
 ```
 
-The eval suite includes a **negative control** proving the guard actually rejects invented text. Without it, "all verified" would be a vacuous claim.
+## Testing
 
-The optional LLM layer is bound by the same rule **in code, not in the prompt**: it may only cite span IDs it was handed, and any other ID is dropped and counted as a rejected hallucination.
-
----
-
-## 11. It also screens the requisition
-
-Transposing the matrix asks a different question: not *"is this candidate good enough"* but *"can anyone who applied answer this at all?"*
-
-> **R5 (FedRAMP) is unmet by every single applicant.** The only positive mention anywhere in the pool sits inside A-04's unsupported keyword blob; A-12 mentions it only to disclaim it. Reported as a **requisition problem**, not a screening result — with recommendations to reclassify, train on hire, or re-source.
-
-> **Requisition conflict.** R1 expects demonstrated migration leadership, but the seven applicants who actually evidence it have a **median of 4.8 years** — above the stated 2–4 year band. The two requirements pull against each other, and the pool itself is the proof.
-
----
-
-
-## 12. Full results
-
-Twelve applications, each built to defeat one specific naive-matcher assumption.
-
-```
-id    trap                   ReqCov EvQual Senior  Risk  Conf   outcome
-A-01  padder                   0.00   0.00   0.98  0.33   34%   do not advance
-A-02  synonym_hider            0.84   0.89   0.83  0.00   80%   advance
-A-03  quiet_star               0.84   0.91   0.74  0.00   83%   advance
-A-04  keyword_farm             0.25   0.25   1.00  0.27   37%   do not advance
-A-05  timeline_contradiction   0.66   0.75   1.00  0.55   50%   do not advance
-A-06  adjacent_domain          0.00   0.88   0.61  0.10   83%   do not advance
-A-07  team_credit              0.50   0.50   0.77  0.20   45%   reservations
-A-08  career_changer           0.66   0.81   0.61  0.20   74%   advance
-A-09  overqualified            0.84   0.94   0.29  0.00   83%   advance
-A-10  cert_heavy               0.24   0.50   0.81  0.20   42%   do not advance
-A-11  sparse_document          0.66   0.92   1.00  0.10   57%   advance
-A-12  near_miss                0.66   0.83   1.00  0.10   76%   advance
+```bash
+npm test
 ```
 
-| ID | Trap | What must happen |
-|---|---|---|
-| A-01 | padder | "Expert in distributed systems" → UNSUPPORTED on one course |
-| A-02 | synonym hider | Meets R1 without the word appearing |
-| A-03 | quiet star | UNDERSTATED — credited above her self-rating |
-| A-04 | keyword farm | 65 skill tokens, coverage stays 0.25 |
-| A-05 | timeline liar | CONTRADICTED, 4 independent failures |
-| A-06 | adjacent domain | Deep expertise, wrong domain for *this* req |
-| A-07 | team credit | Ownership unmet, hard constraint HC1 fails |
-| A-08 | career changer | OSS provider → E4; staging-only k8s → E3 |
-| A-09 | overqualified | Seniority mismatch surfaced separately |
-| A-10 | cert heavy | Certifications capped at E2 |
-| A-11 | sparse doc | High fit, low confidence |
-| A-12 | near miss | Meets R1–R3, misses R4 |
+31 tests across 5 files, run with Node's built-in `node:test` (no external test framework):
 
----
+- **`agent.test.js`** — the LangChain workflow's trace/recommendation shape and that it never leaks `candidate`/`requisition`/`assessment` back out; that LinkedIn refuses to work from a URL alone; that a non-GitHub URL is rejected before any network call is made.
+- **`contradictions.test.js`** — the timeline-contradiction example, resume/cover-note conflicts, title-scope and course-only-expertise flags, overlapping-role de-duplication, that education dates never establish skill duration, that different skills in the same criterion don't falsely conflict, exact source-offset citation, and the negation-vs-"rather than" distinction.
+- **`requisition-analysis.test.js`** — no-full-match detection, junior/experience/salary conflict flags without inventing salary data, the ≥10k-request-scale rule for multi-region, plain-language experience floors, em-dash role-header durations.
+- **`report-export.test.js`** — every sheet is present in order and none render empty; untrusted text can't become a formula; the new Closest-fit shortlist and Criterion coverage sheets carry the right data.
+- **`screening.test.js`** — the external-corroboration promotion (one step, cited to the repo), that it's capped below `strong`, that it never overrides a `conflicting` criterion, and that a candidate with no verification data scores identically to before the feature existed.
 
-## 13. Constraint compliance
+## Tooling & configuration
 
-| Constraint from the problem statement | How it is enforced |
-|---|---|
-| Unsupported claims must not carry the same confidence as evidenced ones | Separate code paths, `support_gap` subtraction, five explicit verdicts |
-| Must not penalise equivalent skills described differently | Typed directional ontology; A-02 meets R1 with zero keyword hits |
-| Must not collapse fit into one opaque score | Four dimensions + separate confidence + Pareto frontier; a test asserts no `score` field exists |
-| Must not fabricate evidence | `validate.py` verbatim guard, 147/147, plus a negative control |
-| Demonstrable within 24 hours | Zero dependencies, sub-second run, 50-assertion suite |
+- **Build**: Vite (`vite.config` inferred by the `@vitejs/plugin-react` default — no custom `vite.config.js` beyond the plugin).
+- **Lint**: `eslint.config.js` — `@eslint/js` recommended rules, `eslint-plugin-react-hooks` (recommended, including the strict `set-state-in-effect` and `rules-of-hooks` checks), `eslint-plugin-react-refresh`. `no-unused-vars` ignores `_`-prefixed names.
+- **Scripts** (`package.json`):
 
----
+  | Command | Does |
+  |---|---|
+  | `npm run dev` | Vite dev server (client only) |
+  | `npm run dev:agent` | Express agent API only |
+  | `npm run dev:full` | Both, concurrently |
+  | `npm run build` | Production client bundle |
+  | `npm run preview` | Preview the production build |
+  | `npm test` | Full test suite |
+  | `npm run lint` | ESLint |
 
-## 14. Architecture
+- **Key dependencies**: `react`/`react-dom`, `vite`, `lucide-react` (icons), `pdfjs-dist`, `mammoth`, `exceljs`, `langchain` + `@langchain/openai`, `zod` (structured LLM output), `express`, `cors`, `dotenv`, `concurrently` (dev).
 
-```
-data/requisition.json          5 required + 4 preferred criteria + 1 hard constraint
-data/applications/A-*.md       12 engineered applications
+## Safeguards & design principles
 
-src/talentscreen/
-  ingest.py       Stage 1  span indexing — every unit gets a stable id (A-03:exp.1.b1)
-  claims.py       Stage 2  claim extraction (assertion sections only) + Stage 4 reconciliation
-  evidence.py     Stage 3  tiering: ownership, metrics, vagueness, team credit, disclaimers
-  ontology.py              typed directional equivalence graph + self-rating lexicon
-  timeline.py              deterministic date arithmetic — no model
-  fit.py          Stages 5-7  criterion matching, 4-dim fit vector, confidence
-  tradeoffs.py    Stage 8  Pareto frontier + pairwise trade-off statements
-  poolgap.py               requirement gap matrix + requisition conflict detection
-  validate.py     Stage 9  citation verbatim guard
-  llm.py                   optional refinement layer — cached, citation-constrained
-  report.py                self-contained HTML report
+- **GitHub**: read-only public profile and repository metadata only. Cannot prove authorship, employment, or proficiency. Never auto-picks a profile from a name search — a human always confirms.
+- **LinkedIn**: no scraping, ever. Only a candidate-authorized text export the recruiter pastes in is compared.
+- **External evidence is bounded**: a cross-check can raise a criterion's confidence by a small, capped amount and promote it by at most one level — never enough to erase a resume contradiction, and never all the way to `strong` on its own.
+- **No fabricated evidence**: every quoted passage is a verbatim slice of the submitted application, addressable by exact character offset and line number.
+- **Confidence ≠ truthfulness**: confidence reflects how well an application (plus any verified external evidence) supports a claim, not the probability the candidate is being honest. Human review remains the final decision.
+- **No composite score**: fit is deliberately kept multi-dimensional (band, required coverage, evidence confidence, pool gaps) rather than collapsed into one number that would hide trade-offs.
 
-tests/test_adversarial.py      50 assertions, one per engineered trap
-out/report.html                generated report
-```
+## Known limitations
 
-**Pipeline:** span index → claim extraction → evidence tiering → terminology equivalence → reconciliation → fit vector & confidence → Pareto & trade-offs → pool gap analysis → citation validation.
+- **State is per-browser, not shared** — `localStorage` only, no backend database. Two recruiters on different machines see different pools.
+- **GitHub's unauthenticated rate limit is 60 requests/hour** — each verification or name search costs one or two requests against that shared limit; heavy use in one browser session can exhaust it (the app surfaces a specific rate-limit message when this happens rather than a generic error).
+- **Resume parsing is best-effort** — a scanned (image-only) PDF has no extractable text and the upload will ask for pasted text instead; PDF row-reconstruction and DOCX extraction are heuristic, not a guarantee of perfect layout fidelity.
+- **The alias/evidence-word lists are English-language and reasonably broad but not exhaustive** — a criterion or evidence phrasing outside the built-in vocabulary won't be recognized until an alias is added via **Edit requisition**.
+- **The optional LLM node only summarizes** — it cannot add, remove, or override any deterministic finding, by design; if you need it to reason more deeply, that would be a deliberate architecture change, not a config flag.

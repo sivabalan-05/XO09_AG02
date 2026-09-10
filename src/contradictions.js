@@ -64,8 +64,8 @@ export function detectContradictions(text, requisition, now = new Date()) {
   }
   for (const claim of passages) {
     const duration = claim.quote.match(/\b(\d+(?:\.\d+)?)\+?\s+years?\s+(?:(?:of|in|with)\s+)?([^.!?;\n]{0,70})/i)
-    const relevant = requisition.criteria.filter((c) => c.aliases.some((t) => containsTerm(claim.quote, t)))
-    const subjects = [...new Set(relevant.flatMap((c) => c.aliases.filter((t) => containsTerm(claim.quote, t))))]
+    const relevant = (requisition.criteria || []).filter((c) => (c.aliases || []).some((t) => containsTerm(claim.quote, t)))
+    const subjects = [...new Set(relevant.flatMap((c) => (c.aliases || []).filter((t) => containsTerm(claim.quote, t))))]
     const sameSubject = (p) => subjects.some((t) => containsTerm(p.quote, t))
     const positives = passages.filter((p) => p.start !== claim.start && sameSubject(p) && action.test(p.quote) && !denial.test(p.quote) && !limited.test(p.quote) && !/education|skills/i.test(p.section))
     if (duration && !denial.test(claim.quote) && (relevant.length || /experience/i.test(claim.quote))) {

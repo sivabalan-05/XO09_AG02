@@ -12,7 +12,7 @@ test('Excel report contains every promised review section and handles empty rows
   const sheets = buildReportSheets({ screened, requisition: defaultRequisition, insights, requisitionAnalysis, generatedAt: new Date('2026-09-09T12:00:00Z') })
   assert.deepEqual(sheets.map((sheet) => sheet.name), [
     'Summary', 'Shortlist', 'Closest-fit shortlist', 'Criterion evidence', 'Claim checks',
-    'Requisition analysis', 'Criterion coverage', 'External evidence review', 'Agent reviews', 'Interview recommendations',
+    'Requisition analysis', 'Criterion coverage', 'External evidence review', 'Compensation & experience', 'Agent reviews', 'Interview recommendations',
   ])
   assert.ok(sheets.every((sheet) => sheet.rows.length > 0))
   assert.equal(sheets.find((sheet) => sheet.name === 'Summary').rows.find((row) => row.Metric === 'Shortlisting safeguard').Value, 'No candidate fully satisfies all required criteria.')

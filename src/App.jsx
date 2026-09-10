@@ -9,7 +9,9 @@ import { defaultRequisition, sampleCandidates } from './data'
 import { getPoolInsights, levelLabels, screenPool } from './screening'
 import { analyzeRequisition } from './requisitionAnalysis'
 import { downloadScreeningWorkbook } from './reportExport'
+import { analyzeExperienceText, candidateExperienceSources, compareSalary, experienceStatusLabel } from './candidateFacts'
 import { verifyGitHubProfile, verifyLinkedInEvidence, extractGithubUrl, extractLinkedInUrl, searchGitHubProfiles } from '../agent/verifiers.js'
+import { createStableCriterionId } from './requirementSuggestions.js'
 
 const views = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
@@ -30,8 +32,61 @@ function LevelPill({ level, compact = false }) {
 
 const STORAGE = { candidates: 'verity:candidates:v2', requisition: 'verity:requisition:v2' }
 const AGENT_API = import.meta.env.VITE_AGENT_API_URL || ''
+const LINKEDIN_OAUTH_API = import.meta.env.VITE_LINKEDIN_OAUTH_API_URL || 'http://127.0.0.1:8787'
+const REQUIREMENT_API = AGENT_API || LINKEDIN_OAUTH_API
+const statusLabels = { active: 'Active', paused: 'Paused', closed: 'Closed' }
 function readStored(key, fallback) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback } catch { return fallback }
+}
+
+function formatRequisitionDate(value) {
+  if (!value) return '08 SEP 2026'
+  const parsed = new Date(`${value}T00:00:00`)
+  if (Number.isNaN(parsed.getTime())) return String(value).toUpperCase()
+  return new Intl.DateTimeFormat('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).format(parsed).toUpperCase()
+}
+
+function ScrollProgress() {
+  const [progress, setProgress] = useState(0)
+  useEffect(() => {
+    let frame = 0
+    const update = () => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => {
+        const available = document.documentElement.scrollHeight - window.innerHeight
+        setProgress(available > 0 ? Math.min(1, window.scrollY / available) : 0)
+      })
+    }
+    update()
+    window.addEventListener('scroll', update, { passive: true })
+    window.addEventListener('resize', update)
+    return () => { cancelAnimationFrame(frame); window.removeEventListener('scroll', update); window.removeEventListener('resize', update) }
+  }, [])
+  return <div className="scroll-progress" aria-hidden="true"><i style={{ transform: `scaleX(${progress})` }} /></div>
+}
+
+function useScrollReveal(trigger) {
+  useEffect(() => {
+    const targets = [...document.querySelectorAll('.req-title-row, .req-meta, .page-content > .section-heading, .page-content > .metric-grid, .page-content > .gap-banner, .page-content > .panel, .page-content > .tradeoff-section, .page-content > .agent-architecture, .page-content > .method-note')]
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    if (reduced || !('IntersectionObserver' in window)) {
+      targets.forEach((target) => target.classList.add('reveal-visible'))
+      return undefined
+    }
+    targets.forEach((target, index) => {
+      target.classList.add('reveal-on-scroll')
+      target.style.setProperty('--reveal-delay', `${Math.min(index % 3, 2) * 55}ms`)
+    })
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return
+        entry.target.classList.add('reveal-visible')
+        observer.unobserve(entry.target)
+      })
+    }, { threshold: 0.08, rootMargin: '0px 0px -5% 0px' })
+    targets.forEach((target) => observer.observe(target))
+    return () => observer.disconnect()
+  }, [trigger])
 }
 
 function Modal({ children, onClose, wide = false, label = 'Dialog' }) {
@@ -58,11 +113,11 @@ function Modal({ children, onClose, wide = false, label = 'Dialog' }) {
   )
 }
 
-function Topbar({ view, openUpload, openHelp, onExport, mobileOpen, setMobileOpen }) {
+function Topbar({ view, requisitionId, openUpload, openHelp, onExport, mobileOpen, setMobileOpen }) {
   return (
     <header className="topbar">
-      <button className="icon-button mobile-menu" onClick={() => setMobileOpen(!mobileOpen)} aria-label="Open navigation"><Menu size={20} /></button>
-      <div className="crumb"><span>Requisitions</span><span>/</span><strong>{view === 'overview' ? 'JR-2048' : views.find((v) => v.id === view)?.label}</strong></div>
+      <button className="icon-button mobile-menu" onClick={() => setMobileOpen(!mobileOpen)} aria-label={mobileOpen ? 'Close navigation' : 'Open navigation'} aria-expanded={mobileOpen} aria-controls="workspace-navigation"><Menu size={20} /></button>
+      <div className="crumb"><span>Requisitions</span><span>/</span><strong>{view === 'overview' ? requisitionId : views.find((v) => v.id === view)?.label}</strong></div>
       <div className="top-actions">
         <button className="text-button help" onClick={openHelp}><CircleHelp size={17} /> How scoring works</button>
         <button className="text-button export-button" onClick={onExport}><Download size={17} /> Export report</button>
@@ -74,12 +129,12 @@ function Topbar({ view, openUpload, openHelp, onExport, mobileOpen, setMobileOpe
 
 function Sidebar({ view, setView, mobileOpen, setMobileOpen }) {
   return (
-    <aside className={`sidebar ${mobileOpen ? 'open' : ''}`}>
-      <div className="brand"><span className="brand-mark"><ShieldCheck size={20} strokeWidth={2.5} /></span><span>verity</span></div>
+    <aside id="workspace-navigation" className={`sidebar ${mobileOpen ? 'open' : ''}`}>
+      <div className="brand"><span className="brand-mark"><ShieldCheck size={20} strokeWidth={2.5} /></span><span><strong>verity</strong><small>Evidence intelligence</small></span></div>
       <nav>
         <p className="nav-label">Workspace</p>
         {views.map(({ id, label, icon: Icon }) => (
-          <button key={id} className={view === id ? 'active' : ''} onClick={() => { setView(id); setMobileOpen(false) }}>
+          <button key={id} className={view === id ? 'active' : ''} aria-current={view === id ? 'page' : undefined} onClick={() => { setView(id); setMobileOpen(false) }}>
             <Icon size={18} /> {label}
           </button>
         ))}
@@ -93,19 +148,20 @@ function Sidebar({ view, setView, mobileOpen, setMobileOpen }) {
   )
 }
 
-function RequisitionHeader({ requisition, screened, onEdit, onFilter }) {
+function RequisitionHeader({ requisition, screened, onEdit, onFilter, activeFilter }) {
   const strong = screened.filter((c) => ['Leading match', 'Strong match'].includes(c.band)).length
+  const status = requisition.status || 'active'
   return (
     <section className="req-header">
-      <div className="eyebrow-row"><span className="status-dot">Active</span><span>JR-2048</span><span>Created 08 Sep 2026</span></div>
+      <div className="eyebrow-row"><span className={`status-dot ${status}`}>{statusLabels[status] || status}</span><span>{requisition.id || defaultRequisition.id}</span><span>Created {formatRequisitionDate(requisition.createdAt)}</span></div>
       <div className="req-title-row">
         <div><h1>{requisition.title}</h1><p>{requisition.team}</p></div>
         <button className="secondary-button" onClick={onEdit}><Pencil size={16} /> Edit requisition</button>
       </div>
       <div className="req-meta">
-        <button onClick={() => onFilter('all')}><Users size={16} /><strong>{screened.length}</strong> applicants</button>
-        <button onClick={() => onFilter('leading')}><Target size={16} /><strong>{strong}</strong> strong matches</button>
-        <button onClick={() => onFilter('flagged')}><AlertCircle size={16} /><strong>{screened.reduce((n, c) => n + c.flags.length, 0)}</strong> claim checks</button>
+        <button className={activeFilter === 'all' ? 'active' : ''} aria-pressed={activeFilter === 'all'} onClick={() => onFilter('all')}><Users size={16} /><strong>{screened.length}</strong> applicants</button>
+        <button className={activeFilter === 'leading' ? 'active' : ''} aria-pressed={activeFilter === 'leading'} onClick={() => onFilter('leading')}><Target size={16} /><strong>{strong}</strong> strong matches</button>
+        <button className={activeFilter === 'flagged' ? 'active' : ''} aria-pressed={activeFilter === 'flagged'} onClick={() => onFilter('flagged')}><AlertCircle size={16} /><strong>{screened.reduce((n, c) => n + c.flags.length, 0)}</strong> claim checks</button>
       </div>
     </section>
   )
@@ -199,7 +255,7 @@ function Insights({ insights, screened, requisition, requisitionAnalysis, onOpen
     <div className="page-content">
       <div className="section-heading"><div><span className="overline">REQUISITION HEALTH</span><h2>What this applicant pool can actually support</h2><p>Coverage is based on concrete evidence—not the frequency of matching keywords.</p></div></div>
       <section className={`no-full-match ${requisitionAnalysis.noFullMatch ? 'active' : ''}`}><ShieldAlert size={22} /><div><span className="overline">SHORTLISTING SAFEGUARD</span><h3>{requisitionAnalysis.noFullMatch ? 'No candidate fully satisfies all required criteria.' : `${requisitionAnalysis.fullMatches.length} candidate${requisitionAnalysis.fullMatches.length === 1 ? '' : 's'} fully satisfy all required criteria.`}</h3><p>{requisitionAnalysis.noFullMatch ? 'The shortlist below shows the closest candidates and the exact weaknesses that still need a recruiter decision.' : 'Trade-offs remain visible for every candidate.'}</p></div></section>
-      <section className="panel requisition-analysis"><div className="panel-heading"><div><span className="overline">SURPRISE CHALLENGE 02</span><h3>Requirement conflict & pool feasibility</h3><p>Checks for incompatible or highly restrictive requirements before shortlisting.</p></div></div><div className="conflict-list">{requisitionAnalysis.conflicts.length ? requisitionAnalysis.conflicts.map((conflict) => <article className={conflict.severity} key={conflict.id}><AlertCircle size={17} /><div><strong>{conflict.title}</strong><p>{conflict.detail}</p></div></article>) : <article className="clear"><CheckCircle2 size={17} /><div><strong>No structural conflict detected</strong><p>Current requirements do not trigger a rule-based requisition conflict. Pool coverage is still shown below.</p></div></article>}</div><div className="requirement-coverage">{requisitionAnalysis.requirementCoverage.map((item) => <div key={item.id}><span>{item.type === 'constraint' ? 'CONSTRAINT' : 'REQUIRED'}</span><strong>{item.name}</strong><p><b>{item.met}</b> of {item.total} candidates have supported evidence / meet this constraint</p><i><em style={{ width: `${item.coverage}%` }} /></i></div>)}</div></section>
+      <section className="panel requisition-analysis"><div className="panel-heading"><div><h3>Requirement conflict & pool feasibility</h3><p>Checks for incompatible or highly restrictive requirements before shortlisting.</p></div></div><div className="conflict-list">{requisitionAnalysis.conflicts.length ? requisitionAnalysis.conflicts.map((conflict) => <article className={conflict.severity} key={conflict.id}><AlertCircle size={17} /><div><strong>{conflict.title}</strong><p>{conflict.detail}</p></div></article>) : <article className="clear"><CheckCircle2 size={17} /><div><strong>No structural conflict detected</strong><p>Current requirements do not trigger a rule-based requisition conflict. Pool coverage is still shown below.</p></div></article>}</div><div className="requirement-coverage">{requisitionAnalysis.requirementCoverage.map((item) => <div key={item.id}><span>{item.type === 'constraint' ? 'CONSTRAINT' : 'REQUIRED'}</span><strong>{item.name}</strong><p><b>{item.met}</b> of {item.total} candidates have supported evidence / meet this constraint</p><i><em style={{ width: `${item.coverage}%` }} /></i></div>)}</div></section>
       <section className="panel tradeoff-shortlist"><div className="panel-heading"><div><h3>Closest-fit shortlist</h3><p>Ordered by required areas met; weaknesses are intentionally not hidden in a composite score.</p></div></div><div className="conflict-shortlist">{requisitionAnalysis.shortlist.map((item) => <button key={item.candidate.id} onClick={() => onOpen(item.candidate)} aria-label={`Open evidence assessment for ${item.candidate.name}`}><Avatar name={item.candidate.name} /><div><h4>{item.candidate.name}</h4><p><CheckCircle2 size={13} /> <strong>Strengths:</strong> {item.strengths.join(', ') || 'No required area strongly evidenced'}</p><p className="shortlist-trade"><AlertCircle size={13} /> <strong>Trade-offs:</strong> {item.tradeoffs.join('; ') || 'No material gap identified'}</p></div><span>{item.matchedRequired}/{requisition.criteria.filter((criterion) => criterion.type === 'required').length}<small>required met</small></span></button>)}</div></section>
       {insights.filter((i) => i.isGap).map((insight) => <PoolGap key={insight.id} insight={insight} poolSize={screened.length} />)}
       <section className="panel coverage-panel">
@@ -220,6 +276,29 @@ function Insights({ insights, screened, requisition, requisitionAnalysis, onOpen
   )
 }
 
+const formatYears = (value) => value === null || value === undefined ? 'Not established' : `${value} year${value === 1 ? '' : 's'}`
+const formatEvidenceDate = (value) => value ? new Intl.DateTimeFormat('en-GB', { month: 'short', year: 'numeric' }).format(new Date(value)) : 'Unknown'
+
+function CompensationExperience({ candidate, requisition, onVerify, onShowSource }) {
+  const salary = compareSalary(candidate, requisition)
+  const experience = candidateExperienceSources(candidate, requisition)
+  const resumeEvidence = experience.resume.datedPassages.length ? experience.resume.datedPassages : experience.resume.supportingPassages
+  const resumeMeets = experience.minimum > 0 && experience.resume.supportedYears !== null ? experience.resume.supportedYears >= experience.minimum : null
+  const linkedinMeets = experience.minimum > 0 && experience.linkedin?.supportedYears !== null && experience.linkedin?.supportedYears !== undefined ? experience.linkedin.supportedYears >= experience.minimum : null
+  return <section className="facts-review" aria-label="Salary and experience verification">
+    <div className="facts-heading"><div><span className="overline">RECRUITER CHECK</span><h3>Compensation & experience verification</h3><p>Each source stays separate so overlapping dates are never double-counted.</p></div><button className="secondary-button" onClick={onVerify}><ShieldCheck size={15} /> Review external evidence</button></div>
+    <article className={`salary-comparison ${salary.status}`}>
+      <div className="fact-icon"><Target size={20} /></div><div><span>Job salary ceiling</span><strong>{salary.cap === null ? 'Not set' : `₹${salary.cap} LPA`}</strong></div><div><span>Candidate expectation</span><strong>{salary.expected === null ? 'Not provided' : `₹${salary.expected} LPA`}</strong>{salary.expectationSource && <small>From {salary.expectationSource}</small>}</div><div className="salary-difference"><span>Difference</span><strong>{salary.label}</strong></div>
+    </article>
+    <div className="experience-title"><div><h4>Experience evidence by source</h4><p>Job minimum: {experience.minimum ? `${experience.minimum}+ years` : 'No minimum configured'}.</p></div><span>GitHub is activity evidence—not employment tenure.</span></div>
+    <div className="experience-sources">
+      <article className={`experience-source ${experience.resume.status}`}><div className="source-heading"><FileText size={18} /><div><strong>Résumé</strong><span className="source-status">{experienceStatusLabel(experience.resume.status)}</span></div>{resumeMeets !== null && <b className={resumeMeets ? 'meets' : 'misses'}>{resumeMeets ? 'Meets minimum' : 'Below minimum'}</b>}</div><dl><div><dt>Claimed</dt><dd>{formatYears(experience.resume.claimedYears)}</dd></div><div><dt>Supported duration</dt><dd>{formatYears(experience.resume.supportedYears)}</dd></div></dl>{experience.resume.flag && <p className="source-warning"><AlertCircle size={13} /> {experience.resume.flag.assessment}</p>}{resumeEvidence.length ? <div className="fact-evidence">{resumeEvidence.slice(0, 2).map((passage) => <button key={passage.start} onClick={() => onShowSource(passage)}>“{passage.quote}” <span>{passage.section} · line {passage.line} <ArrowRight size={11} /></span></button>)}</div> : <p className="source-empty">No separate dated or responsibility passage supports a duration.</p>}</article>
+      <article className="experience-source linkedin"><div className="source-heading"><Link2 size={18} /><div><strong>LinkedIn</strong><span className="source-status">{experience.linkedin ? experienceStatusLabel(experience.linkedin.status) : experience.linkedinConnection?.status === 'identity-connected' ? 'Account connected · identity fields only' : 'Not reviewed'}</span></div>{linkedinMeets !== null && <b className={linkedinMeets ? 'meets' : 'misses'}>{linkedinMeets ? 'Meets minimum' : 'Below minimum'}</b>}</div>{experience.linkedin ? <><dl><div><dt>Claimed</dt><dd>{formatYears(experience.linkedin.claimedYears)}</dd></div><div><dt>Supported duration</dt><dd>{formatYears(experience.linkedin.supportedYears)}</dd></div></dl>{experience.linkedin.supportingPassages?.length ? <div className="fact-evidence static">{experience.linkedin.supportingPassages.slice(0, 2).map((passage, index) => <blockquote key={passage.start ?? index}>“{passage.quote}”</blockquote>)}</div> : <p className="source-empty">The authorized export contains no separate work passage supporting a duration.</p>}</> : experience.linkedinConnection?.status === 'identity-connected' ? <><p className="connected-person">Connected as <strong>{experience.linkedinConnection.oauthProfile?.name || 'LinkedIn member'}</strong></p><p className="source-empty">Standard LinkedIn access did not provide positions or skills. These remain unverified until the app receives approved talent-data scopes.</p></> : <p className="source-empty">Connect the candidate’s LinkedIn account or add a candidate-authorized profile export.</p>}</article>
+      <article className="experience-source github"><div className="source-heading"><GitBranch size={18} /><div><strong>GitHub</strong><span className="source-status">{experience.github ? 'Public activity observed' : 'Not reviewed'}</span></div></div>{experience.github ? <><dl><div><dt>Observed span</dt><dd>{formatYears(experience.github.spanYears)}</dd></div><div><dt>Sample</dt><dd>{experience.github.repositoryCount} public repos</dd></div></dl><p className="activity-window">{formatEvidenceDate(experience.github.firstObservedAt)} → {formatEvidenceDate(experience.github.lastObservedAt)}</p><p className="source-empty">Corroborates public technical activity only. It cannot prove professional experience, authorship, or identity.</p></> : <p className="source-empty">Review a candidate-provided profile to inspect public repository activity.</p>}</article>
+    </div>
+  </section>
+}
+
 function CandidateDetail({ candidate, requisition, onClose, onRemove, onVerify, onRunAgent }) {
   const [tab, setTab] = useState('assessment')
   const [sourceLine, setSourceLine] = useState(null)
@@ -234,6 +313,7 @@ function CandidateDetail({ candidate, requisition, onClose, onRemove, onVerify, 
       <div className="detail-tabs"><button className={tab === 'assessment' ? 'active' : ''} onClick={() => setTab('assessment')}>Criterion assessment</button><button className={tab === 'source' ? 'active' : ''} onClick={() => setTab('source')}>Source application</button></div>
       <div className="detail-body">
         {tab === 'assessment' ? <>
+          <CompensationExperience candidate={candidate} requisition={requisition} onVerify={onVerify} onShowSource={showSource} />
           <section className="claim-checks" aria-label="Contradiction and unsupported claim checks">
             <div className="agent-status-card"><Bot size={18} /><div><strong>LangChain review {candidate.agentReview ? 'completed' : 'available'}</strong><p>{candidate.agentReview?.recommendation || 'Run the agent to create an auditable execution trace and a human-review recommendation.'}</p>{candidate.agentReview?.narrative && <small>{candidate.agentReview.narrative}</small>}{candidate.agentReview?.modelStatus && <small>{candidate.agentReview.modelStatus}</small>}</div><button className="secondary-button" onClick={onRunAgent}>{candidate.agentReview ? 'Run again' : 'Run agent'}</button></div>
             {candidate.verification && <div className="verification-mini"><ShieldCheck size={16} /><span><strong>External evidence:</strong> {Object.values(candidate.verification).filter(Boolean).map((item) => `${item.provider} · ${item.status}`).join(' · ') || 'No verified source'}</span><button onClick={onVerify}>Review</button></div>}
@@ -375,20 +455,145 @@ function UploadModal({ onClose, onAdd, candidateCount }) {
 }
 
 function EditRequisition({ requisition, onClose, onSave }) {
-  const [draft, setDraft] = useState(() => structuredClone(requisition))
+  const [draft, setDraft] = useState(() => structuredClone({ ...defaultRequisition, ...requisition }))
+  const [generationMode, setGenerationMode] = useState('enrich')
+  const [proposal, setProposal] = useState(null)
+  const [selectedTerms, setSelectedTerms] = useState(() => new Set())
+  const [includedCriteria, setIncludedCriteria] = useState(() => new Set())
+  const [agentState, setAgentState] = useState({ status: 'idle', message: '' })
   const updateCriterion = (index, field, value) => setDraft({ ...draft, criteria: draft.criteria.map((c, i) => i === index ? { ...c, [field]: value } : c) })
   const updateConstraint = (field, value) => setDraft({ ...draft, constraints: { minExperienceYears: 0, maxSalaryLpa: null, seniority: 'junior', ...(draft.constraints || {}), [field]: typeof value === 'number' ? Math.max(0, value) : value } })
+
+  const suggestionKey = (criterionIndex, suggestionIndex) => `${criterionIndex}:${suggestionIndex}`
+  const toggleTerm = (key) => setSelectedTerms((current) => {
+    const next = new Set(current)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    return next
+  })
+  const toggleCriterion = (criterionIndex) => setIncludedCriteria((current) => {
+    const next = new Set(current)
+    if (next.has(criterionIndex)) next.delete(criterionIndex)
+    else next.add(criterionIndex)
+    return next
+  })
+  const generateRequirements = async () => {
+    if (!draft.title?.trim() || !draft.description?.trim()) {
+      setAgentState({ status: 'error', message: 'Add a role title and job description before generating terminology.' })
+      return
+    }
+    setAgentState({ status: 'loading', message: 'Analyzing the role and building a terminology map…' })
+    setProposal(null)
+    try {
+      const response = await fetch(`${REQUIREMENT_API}/api/agent/requisition-intelligence`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: generationMode,
+          roleTitle: draft.title,
+          jobDescription: draft.description,
+          criteria: generationMode === 'enrich' ? draft.criteria.map(({ id, name, type, description, aliases = [] }) => ({ id, name, type, description, aliases })) : [],
+        }),
+        signal: AbortSignal.timeout(20000),
+      })
+      const body = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(body.message || body.error || 'The requirement intelligence service is unavailable.')
+      const criteria = Array.isArray(body.criteria) ? body.criteria : []
+      if (!criteria.length) throw new Error('The agent returned no usable criteria. Add more detail to the job description and try again.')
+      const nextSelected = new Set()
+      const nextIncluded = new Set()
+      criteria.forEach((criterion, criterionIndex) => {
+        nextIncluded.add(criterionIndex)
+        ;(criterion.suggestions || []).forEach((suggestion, suggestionIndex) => {
+          if (suggestion.relationship !== 'related') nextSelected.add(suggestionKey(criterionIndex, suggestionIndex))
+        })
+      })
+      setProposal({ ...body, criteria })
+      setSelectedTerms(nextSelected)
+      setIncludedCriteria(nextIncluded)
+      setAgentState({ status: 'ready', message: `Generated ${criteria.length} reviewable ${criteria.length === 1 ? 'criterion' : 'criteria'}. Nothing affects screening until you apply and save.` })
+    } catch (error) {
+      const message = error?.name === 'TimeoutError'
+        ? 'Requirement generation timed out. Confirm the agent server and model are available, then try again.'
+        : error.message || 'Could not generate the requirement map.'
+      setAgentState({ status: 'error', message })
+    }
+  }
+  const applyProposal = () => {
+    if (!proposal) return
+    const selectedFor = (criterion, criterionIndex) => (criterion.suggestions || [])
+      .filter((suggestion, suggestionIndex) => selectedTerms.has(suggestionKey(criterionIndex, suggestionIndex)) && suggestion.relationship !== 'related')
+      .map((suggestion) => suggestion.term)
+    if (proposal.mode === 'replace') {
+      const usedIds = []
+      const nextCriteria = proposal.criteria
+        .map((criterion, criterionIndex) => ({ criterion, criterionIndex }))
+        .filter(({ criterionIndex }) => includedCriteria.has(criterionIndex))
+        .map(({ criterion, criterionIndex }) => {
+          const id = createStableCriterionId(criterion.id || criterion.name, usedIds)
+          usedIds.push(id)
+          return {
+            id,
+            name: criterion.name,
+            type: criterion.type === 'preferred' ? 'preferred' : 'required',
+            description: criterion.description,
+            aliases: selectedFor(criterion, criterionIndex),
+          }
+        })
+      if (!nextCriteria.length) {
+        setAgentState({ status: 'error', message: 'Select at least one generated criterion before applying the new map.' })
+        return
+      }
+      setDraft({ ...draft, criteria: nextCriteria })
+    } else {
+      setDraft({
+        ...draft,
+        criteria: draft.criteria.map((criterion) => {
+          const criterionIndex = proposal.criteria.findIndex((item) => item.sourceCriterionId === criterion.id || item.id === criterion.id)
+          if (criterionIndex < 0 || !includedCriteria.has(criterionIndex)) return criterion
+          const generated = selectedFor(proposal.criteria[criterionIndex], criterionIndex)
+          const aliases = [...(criterion.aliases || []), ...generated].filter((term, index, all) => all.findIndex((other) => other.toLocaleLowerCase() === term.toLocaleLowerCase()) === index)
+          return { ...criterion, aliases }
+        }),
+      })
+    }
+    setProposal(null)
+    setAgentState({ status: 'applied', message: 'Approved terminology was added to this draft. Save & rescreen to use it.' })
+  }
   return (
     <Modal onClose={onClose} wide label="Edit requisition criteria">
-      <div className="modal-header"><div><span className="overline">JR-2048</span><h2>Edit requisition criteria</h2><p>Assessments refresh immediately after you save.</p></div><button className="icon-button" onClick={onClose} aria-label="Close requisition editor"><X size={20} /></button></div>
-      <div className="edit-body"><div className="edit-top"><label className="field"><span>Role title</span><input value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} /></label><label className="field"><span>Team & location</span><input value={draft.team} onChange={(e) => setDraft({ ...draft, team: e.target.value })} /></label></div><div className="constraint-editor"><span className="overline">RESTRICTIVE REQUIREMENTS</span><p>These fields are checked against the whole pool and against the role level.</p><div><label className="field"><span>Minimum documented experience (years)</span><input type="number" min="0" value={draft.constraints?.minExperienceYears ?? 0} onChange={(e) => updateConstraint('minExperienceYears', Number(e.target.value) || 0)} /></label><label className="field"><span>Maximum salary (₹ LPA) <small>optional</small></span><input type="number" min="0" value={draft.constraints?.maxSalaryLpa ?? ''} onChange={(e) => updateConstraint('maxSalaryLpa', e.target.value === '' ? null : Number(e.target.value))} /></label><label className="field"><span>Target level</span><select value={draft.constraints?.seniority || 'junior'} onChange={(e) => updateConstraint('seniority', e.target.value)}><option value="junior">Junior / entry</option><option value="mid">Mid-level</option><option value="senior">Senior</option></select></label></div></div><p className="edit-helper">Aliases let equivalent wording count toward the same skill. Separate terms with commas.</p><div className="criteria-editor">{draft.criteria.map((criterion, index) => <div className="criterion-edit" key={criterion.id}><span className={`criterion-type ${criterion.type}`}>{criterion.type}</span><div><input className="criterion-name-input" aria-label={`Criterion ${index + 1} name`} value={criterion.name} onChange={(e) => updateCriterion(index, 'name', e.target.value)} /><textarea rows={2} aria-label={`${criterion.name} description`} value={criterion.description} onChange={(e) => updateCriterion(index, 'description', e.target.value)} /><label><span>Equivalent terms</span><input value={criterion.aliases.join(', ')} onChange={(e) => updateCriterion(index, 'aliases', e.target.value.split(',').map((x) => x.trim()).filter(Boolean))} /></label></div></div>)}</div></div>
-      <div className="modal-footer"><button className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" onClick={() => onSave(draft)}><Check size={17} /> Save & rescreen</button></div>
+      <div className="modal-header"><div><span className="overline">{draft.id || defaultRequisition.id}</span><h2>Edit requisition criteria</h2><p>Requisition details and assessments refresh immediately after you save.</p></div><button className="icon-button" onClick={onClose} aria-label="Close requisition editor"><X size={20} /></button></div>
+      <div className="edit-body">
+        <div className="requisition-meta-editor"><label className="field"><span>Requisition ID</span><input required maxLength={24} value={draft.id || ''} onChange={(e) => setDraft({ ...draft, id: e.target.value.toUpperCase() })} /></label><label className="field"><span>Status</span><select value={draft.status || 'active'} onChange={(e) => setDraft({ ...draft, status: e.target.value })}><option value="active">Active</option><option value="paused">Paused</option><option value="closed">Closed</option></select></label><label className="field"><span>Created date</span><input required type="date" value={draft.createdAt || ''} onChange={(e) => setDraft({ ...draft, createdAt: e.target.value })} /></label></div>
+        <div className="edit-top"><label className="field"><span>Role title</span><input value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} /></label><label className="field"><span>Team & location</span><input value={draft.team} onChange={(e) => setDraft({ ...draft, team: e.target.value })} /></label></div>
+        <label className="field"><span>Complete job description <small>used by the requirement intelligence agent</small></span><textarea rows={5} value={draft.description || ''} onChange={(e) => setDraft({ ...draft, description: e.target.value })} placeholder="Describe the role, responsibilities, required skills and preferred experience…" /></label>
+        <section className="requirement-agent" aria-labelledby="requirement-agent-heading">
+          <div className="requirement-agent-heading"><div><span className="overline">REQUIREMENT INTELLIGENCE</span><h3 id="requirement-agent-heading"><Sparkles size={18} /> Generate role terminology</h3><p>LangChain proposes a role-specific map. You approve every term before it can affect screening.</p></div><button className="primary-button" type="button" disabled={agentState.status === 'loading'} onClick={generateRequirements}>{agentState.status === 'loading' ? <><span className="spinner" /> Generating…</> : <><Sparkles size={16} /> Generate with AI</>}</button></div>
+          <div className="generation-modes" role="radiogroup" aria-label="Requirement generation mode">
+            <label className={generationMode === 'enrich' ? 'selected' : ''}><input type="radio" name="generation-mode" value="enrich" checked={generationMode === 'enrich'} onChange={() => { setGenerationMode('enrich'); setProposal(null) }} /><span><strong>Enrich current criteria</strong><small>Keep requirements and fill missing equivalent terminology.</small></span></label>
+            <label className={generationMode === 'replace' ? 'selected' : ''}><input type="radio" name="generation-mode" value="replace" checked={generationMode === 'replace'} onChange={() => { setGenerationMode('replace'); setProposal(null) }} /><span><strong>Generate a new map</strong><small>Use for a different role, such as game development.</small></span></label>
+          </div>
+          {agentState.message && <div className={`agent-message ${agentState.status}`} role={agentState.status === 'error' ? 'alert' : 'status'}>{agentState.status === 'error' ? <AlertCircle size={17} /> : <CheckCircle2 size={17} />}<span>{agentState.message}</span></div>}
+          {proposal && <div className="requirement-proposal">
+            <div className="proposal-header"><div><strong>Review the agent proposal</strong><p>Equivalent and technology terms are selected. Related skills remain unselected because they must not create false matches.</p></div><span>{proposal.criteria.length} criteria</span></div>
+            {proposal.warnings?.length > 0 && <div className="proposal-warnings"><ShieldAlert size={17} /><div>{proposal.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div></div>}
+            <div className="proposal-criteria">{proposal.criteria.map((criterion, criterionIndex) => <article key={criterion.id || criterion.sourceCriterionId || criterionIndex} className={!includedCriteria.has(criterionIndex) ? 'excluded' : ''}>
+              <div className="proposal-criterion-title"><label><input type="checkbox" checked={includedCriteria.has(criterionIndex)} onChange={() => toggleCriterion(criterionIndex)} /><span><small>{criterion.type}</small><strong>{criterion.name}</strong></span></label><p>{criterion.description}</p></div>
+              <div className="suggestion-list">{(criterion.suggestions || []).map((suggestion, suggestionIndex) => { const key = suggestionKey(criterionIndex, suggestionIndex); return <label className={`suggestion-chip ${suggestion.relationship}`} key={key} title={suggestion.reason || ''}><input type="checkbox" disabled={!includedCriteria.has(criterionIndex)} checked={selectedTerms.has(key)} onChange={() => toggleTerm(key)} /><span>{suggestion.term}</span><small>{suggestion.relationship}</small></label> })}</div>
+            </article>)}</div>
+            <div className="proposal-actions"><span>Model: {proposal.model || 'configured requirement model'} · proposal only</span><button type="button" className="secondary-button" onClick={() => { setProposal(null); setAgentState({ status: 'idle', message: '' }) }}>Discard</button><button type="button" className="primary-button" onClick={applyProposal}><Check size={16} /> Apply selected terms</button></div>
+          </div>}
+        </section>
+        <div className="constraint-editor"><span className="overline">RESTRICTIVE REQUIREMENTS</span><p>These fields are checked against the whole pool and against the role level.</p><div><label className="field"><span>Minimum documented experience (years)</span><input type="number" min="0" value={draft.constraints?.minExperienceYears ?? 0} onChange={(e) => updateConstraint('minExperienceYears', Number(e.target.value) || 0)} /></label><label className="field"><span>Maximum salary (₹ LPA) <small>optional</small></span><input type="number" min="0" value={draft.constraints?.maxSalaryLpa ?? ''} onChange={(e) => updateConstraint('maxSalaryLpa', e.target.value === '' ? null : Number(e.target.value))} /></label><label className="field"><span>Target level</span><select value={draft.constraints?.seniority || 'junior'} onChange={(e) => updateConstraint('seniority', e.target.value)}><option value="junior">Junior / entry</option><option value="mid">Mid-level</option><option value="senior">Senior</option></select></label></div></div>
+        <p className="edit-helper">These approved terms drive deterministic matching. You can still correct them before saving.</p><div className="criteria-editor">{draft.criteria.map((criterion, index) => <div className="criterion-edit" key={criterion.id}><span className={`criterion-type ${criterion.type}`}>{criterion.type}</span><div><input className="criterion-name-input" aria-label={`Criterion ${index + 1} name`} value={criterion.name} onChange={(e) => updateCriterion(index, 'name', e.target.value)} /><textarea rows={2} aria-label={`${criterion.name} description`} value={criterion.description} onChange={(e) => updateCriterion(index, 'description', e.target.value)} /><label><span>Approved equivalent terms</span><input value={(criterion.aliases || []).join(', ')} onChange={(e) => updateCriterion(index, 'aliases', e.target.value.split(',').map((x) => x.trim()).filter(Boolean))} /></label></div></div>)}</div>
+      </div>
+      <div className="modal-footer"><button className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" onClick={() => onSave({ ...draft, id: draft.id?.trim() || defaultRequisition.id, status: draft.status || 'active', createdAt: draft.createdAt || defaultRequisition.createdAt })}><Check size={17} /> Save & rescreen</button></div>
     </Modal>
   )
 }
 
 function CompareModal({ candidates, requisition, onClose, onOpen }) {
-  return <Modal onClose={onClose} wide label="Compare candidate trade-offs"><div className="modal-header"><div><span className="overline">SIDE-BY-SIDE</span><h2>Candidate trade-offs</h2><p>Compare evidence by criterion. No composite score hides the differences.</p></div><button className="icon-button" onClick={onClose} aria-label="Close comparison"><X size={20} /></button></div><div className="compare-matrix" style={{ '--compare-count': candidates.length }}><div className="compare-grid compare-head"><span>Criterion</span>{candidates.map((candidate) => <button key={candidate.id} onClick={() => onOpen(candidate)}><Avatar name={candidate.name} size="sm" /><span><strong>{candidate.name}</strong><small>{candidate.band}</small></span></button>)}</div>{requisition.criteria.map((criterion) => <div className="compare-grid" key={criterion.id}><span className="matrix-criterion"><strong>{criterion.name}</strong><small>{criterion.type}</small></span>{candidates.map((candidate) => { const item = candidate.assessments.find((a) => a.criterionId === criterion.id); return <div className="matrix-cell" key={candidate.id}><LevelPill level={item.level} compact /><p>{item.evidence[0] || 'No supporting passage found.'}</p></div> })}</div>)}</div><div className="modal-footer"><button className="primary-button" onClick={onClose}>Done comparing</button></div></Modal>
+  return <Modal onClose={onClose} wide label="Compare candidate trade-offs"><div className="modal-header"><div><span className="overline">SIDE-BY-SIDE</span><h2>Candidate trade-offs</h2><p>Compare evidence by criterion. No composite score hides the differences.</p></div><button className="icon-button" onClick={onClose} aria-label="Close comparison"><X size={20} /></button></div><div className="compare-matrix" style={{ '--compare-count': candidates.length }}><div className="compare-grid compare-head"><span>Criterion</span>{candidates.map((candidate) => <button key={candidate.id} onClick={() => onOpen(candidate)}><Avatar name={candidate.name} size="sm" /><span><strong>{candidate.name}</strong><small>{candidate.band}</small></span></button>)}</div><div className="compare-grid compare-fact-row"><span className="matrix-criterion"><strong>Salary difference</strong><small>job constraint</small></span>{candidates.map((candidate) => { const salary = compareSalary(candidate, requisition); return <div className="matrix-cell" key={candidate.id}><span className={`fact-pill ${salary.status}`}>{salary.label}</span><p>Job: {salary.cap === null ? 'No ceiling' : `₹${salary.cap} LPA`} · Candidate: {salary.expected === null ? 'Not provided' : `₹${salary.expected} LPA`}</p></div> })}</div><div className="compare-grid compare-fact-row"><span className="matrix-criterion"><strong>Résumé experience</strong><small>internally cross-checked</small></span>{candidates.map((candidate) => { const experience = analyzeExperienceText(candidate.text); return <div className="matrix-cell" key={candidate.id}><span className={`fact-pill ${experience.status}`}>{experienceStatusLabel(experience.status)}</span><p>Claimed: {formatYears(experience.claimedYears)} · Supported: {formatYears(experience.supportedYears)}</p></div> })}</div>{requisition.criteria.map((criterion) => <div className="compare-grid" key={criterion.id}><span className="matrix-criterion"><strong>{criterion.name}</strong><small>{criterion.type}</small></span>{candidates.map((candidate) => { const item = candidate.assessments.find((a) => a.criterionId === criterion.id); return <div className="matrix-cell" key={candidate.id}><LevelPill level={item.level} compact /><p>{item.evidence[0] || 'No supporting passage found.'}</p></div> })}</div>)}</div><div className="modal-footer"><button className="primary-button" onClick={onClose}>Done comparing</button></div></Modal>
 }
 
 function CompareTray({ selected, screened, onClear, onOpen, onCompare }) {
@@ -418,6 +623,7 @@ function VerificationModal({ candidate, requisition, onClose, onSave }) {
   const [linkedinText, setLinkedinText] = useState('')
   const [githubResult, setGithubResult] = useState(candidate.verification?.github || null)
   const [linkedinResult, setLinkedinResult] = useState(candidate.verification?.linkedin || null)
+  const [linkedinOAuthStatus, setLinkedinOAuthStatus] = useState(null)
   const [searchResults, setSearchResults] = useState(null)
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
@@ -440,6 +646,24 @@ function VerificationModal({ candidate, requisition, onClose, onSave }) {
     try { const result = AGENT_API ? await request('/api/verify/linkedin', { url, authorizedText: linkedinText, requisition }) : verifyLinkedInEvidence({ url, authorizedText: linkedinText, requisition }); setLinkedinResult(result); onSave({ linkedin: result }) }
     catch (err) { setError(err.message) } finally { setBusy('') }
   }
+  const connectLinkedIn = async () => {
+    setBusy('linkedin-oauth'); setError('')
+    const popup = window.open('', 'verity-linkedin-oauth', 'popup=yes,width=560,height=720')
+    if (!popup) { setBusy(''); setError('Allow pop-ups for this site, then try connecting LinkedIn again.'); return }
+    popup.document.write('<p style="font:16px system-ui;padding:24px">Preparing the secure LinkedIn connection…</p>')
+    const popupMonitor = window.setInterval(() => { if (popup.closed) { window.clearInterval(popupMonitor); setBusy('') } }, 500)
+    try {
+      const response = await fetch(`${LINKEDIN_OAUTH_API}/api/auth/linkedin/start?candidateId=${encodeURIComponent(candidate.id)}`, { signal: AbortSignal.timeout(8000) })
+      const body = await response.json().catch(() => ({}))
+      if (!response.ok || !body.authorizationUrl) throw new Error(body.error || 'LinkedIn OAuth is not configured on the agent server.')
+      popup.location.assign(body.authorizationUrl)
+    } catch (err) {
+      window.clearInterval(popupMonitor)
+      popup.close()
+      setBusy('')
+      setError(err.message || 'Could not start the LinkedIn connection.')
+    }
+  }
   const chooseGithubMatch = (profile) => { setSearchResults(null); setGithubUrl(profile.url); checkGitHub(profile.url) }
   // A resume-provided link is used automatically — nothing is being inferred,
   // the candidate wrote it themselves. With no link, fall back to searching by
@@ -461,8 +685,59 @@ function VerificationModal({ candidate, requisition, onClose, onSave }) {
     if (resumeLinkedinUrl) Promise.resolve().then(() => { setLinkedinUrl(resumeLinkedinUrl); checkLinkedIn(resumeLinkedinUrl) })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candidate.id])
-  const renderResult = (result) => result && <div className={`provider-result ${result.status}`}><strong>{result.provider} · {result.status.replaceAll('-', ' ')}</strong><p>{result.message || result.disclaimer}</p>{result.profile && <p>Profile: <a href={result.profile.url} target="_blank" rel="noreferrer">@{result.profile.handle} <ExternalLink size={12} /></a> · {result.profile.publicRepos} public repos</p>}{result.evidence?.length > 0 && <ul>{result.evidence.slice(0, 4).map((item, index) => <li key={item.url || index}>{typeof item === 'string' ? item : <a href={item.url} target="_blank" rel="noreferrer">{item.name} · {item.language} <ExternalLink size={11} /></a>}</li>)}</ul>}{result.criteriaSignals?.length > 0 && <p><strong>Terminology signals to review:</strong> {[...new Set(result.criteriaSignals.map((signal) => signal.criterion))].join(', ')}. These are not proficiency scores.</p>}</div>
-  return <Modal onClose={onClose} wide label="External evidence review"><div className="modal-header"><div><span className="overline">CONSENT-BASED VERIFICATION</span><h2>External evidence review</h2><p>For {candidate.name}. A matching skill term here is folded into that criterion's confidence as a small, capped, cited cross-check — see it under "Cross-checked against external evidence" on the Criterion assessment tab. It never overrides a contradiction and can't push a criterion to "strong" on its own.</p></div><button className="icon-button" onClick={onClose} aria-label="Close verification"><X size={20} /></button></div><div className="verification-body"><section className="provider-card"><div><GitBranch size={21} /><div><h3>GitHub public evidence</h3><p>Read-only public profile and repository metadata. It cannot prove authorship, skill level or employment.</p></div></div>{resumeGithubUrl && githubUrl === resumeGithubUrl && <small className="auto-detected"><Sparkles size={12} /> Link found in the resume — checked automatically.</small>}<label className="field"><span>Candidate-provided GitHub profile</span><input value={githubUrl} onChange={(event) => setGithubUrl(event.target.value)} placeholder="https://github.com/username" /></label><button className="secondary-button" disabled={busy === 'github'} onClick={() => checkGitHub()}>{busy === 'github' ? 'Checking…' : 'Review public GitHub'}</button>{!githubUrl && (searching ? <p className="search-status">Searching GitHub for “{candidate.name}”…</p> : searchResults && (searchResults.length ? <div className="github-search-results"><span>No link in the resume. Possible matches for “{candidate.name}” — confirm before using one:</span>{searchResults.map((profile) => <div className="github-search-row" key={profile.login}><img src={profile.avatarUrl} alt="" width={24} height={24} /><a href={profile.url} target="_blank" rel="noreferrer">@{profile.login} <ExternalLink size={11} /></a><button className="text-link" onClick={() => chooseGithubMatch(profile)}>Use this profile</button></div>)}</div> : <p className="search-status">No GitHub profiles found for “{candidate.name}”. Enter a profile URL if you have one.</p>))}{searchError && <p className="search-status">{searchError}</p>}{renderResult(githubResult)}</section><section className="provider-card"><div><Link2 size={21} /><div><h3>LinkedIn authorized evidence</h3><p>No profile scraping. Use a candidate-authorized export here, or replace this adapter with your organization’s approved LinkedIn integration.</p></div></div>{resumeLinkedinUrl && linkedinUrl === resumeLinkedinUrl && <small className="auto-detected"><Sparkles size={12} /> Link found in the resume — add an authorized export below to compare it.</small>}<label className="field"><span>Public profile link <small>optional</small></span><input value={linkedinUrl} onChange={(event) => setLinkedinUrl(event.target.value)} placeholder="https://www.linkedin.com/in/..." /></label><label className="field"><span>Candidate-authorized profile export</span><textarea rows={5} value={linkedinText} onChange={(event) => setLinkedinText(event.target.value)} placeholder="Paste experience or project text the candidate has authorized you to use…" /></label><button className="secondary-button" disabled={busy === 'linkedin'} onClick={() => checkLinkedIn()}>{busy === 'linkedin' ? 'Comparing…' : 'Compare authorized export'}</button>{renderResult(linkedinResult)}</section>{error && <div className="form-error"><AlertCircle size={16} />{error}</div>}<div className="consent-note"><ShieldAlert size={18} /><p>Recruiter safeguard: never use protected characteristics, inferred identity, network connections, or private data in the fit assessment. These providers are evidence sources for human review—not automatic background checks.</p></div></div><div className="modal-footer"><button className="primary-button" onClick={onClose}>Done</button></div></Modal>
+  useEffect(() => {
+    const controller = new AbortController()
+    fetch(`${LINKEDIN_OAUTH_API}/api/auth/linkedin/status`, { signal: controller.signal })
+      .then(async (response) => response.ok ? response.json() : Promise.reject(new Error('LinkedIn OAuth status unavailable.')))
+      .then(setLinkedinOAuthStatus)
+      .catch((err) => { if (err.name !== 'AbortError') setLinkedinOAuthStatus({ configured: false, message: 'Start the agent backend with npm run dev:full, then configure LinkedIn OAuth.' }) })
+    return () => controller.abort()
+  }, [])
+  useEffect(() => {
+    const oauthOrigin = new URL(LINKEDIN_OAUTH_API, window.location.origin).origin
+    const receiveLinkedIn = (event) => {
+      if (event.origin !== oauthOrigin || event.data?.type !== 'verity:linkedin-oauth') return
+      if (event.data.candidateId && event.data.candidateId !== candidate.id) return
+      setBusy('')
+      if (!event.data.ok || !event.data.verification) { setError(event.data.error || 'LinkedIn authorization failed.'); return }
+      const result = { ...event.data.verification, url: linkedinUrl || resumeLinkedinUrl || '' }
+      setLinkedinResult(result)
+      onSave({ linkedin: result })
+    }
+    window.addEventListener('message', receiveLinkedIn)
+    return () => window.removeEventListener('message', receiveLinkedIn)
+  }, [candidate.id, linkedinUrl, onSave, resumeLinkedinUrl])
+  const renderResult = (result) => result && <div className={`provider-result ${result.status}`}><strong>{result.provider} · {result.status.replaceAll('-', ' ')}</strong><p>{result.message || result.disclaimer}</p>{result.oauthProfile && <p className="connected-person">Connected member: <strong>{result.oauthProfile.name || 'LinkedIn member'}</strong></p>}{result.profile && <p>Profile: <a href={result.profile.url} target="_blank" rel="noreferrer">@{result.profile.handle} <ExternalLink size={12} /></a> · {result.profile.publicRepos} public repos</p>}{result.evidence?.length > 0 && <ul>{result.evidence.slice(0, 4).map((item, index) => <li key={item.url || index}>{typeof item === 'string' ? item : <a href={item.url} target="_blank" rel="noreferrer">{item.name} · {item.language} <ExternalLink size={11} /></a>}</li>)}</ul>}{result.criteriaSignals?.length > 0 && <p><strong>Terminology signals to review:</strong> {[...new Set(result.criteriaSignals.map((signal) => signal.criterion))].join(', ')}. These are not proficiency scores.</p>}{result.disclaimer && result.message !== result.disclaimer && <p><strong>Boundary:</strong> {result.disclaimer}</p>}</div>
+  return <Modal onClose={onClose} wide label="External evidence review">
+    <div className="modal-header"><div><span className="overline">CONSENT-BASED VERIFICATION</span><h2>External evidence review</h2><p>For {candidate.name}. A matching skill term here is folded into that criterion's confidence as a small, capped, cited cross-check. It never overrides a contradiction and cannot make unsupported evidence “strong” on its own.</p></div><button className="icon-button" onClick={onClose} aria-label="Close verification"><X size={20} /></button></div>
+    <div className="verification-body">
+      <section className="provider-card">
+        <div><GitBranch size={21} /><div><h3>GitHub public evidence</h3><p>Read-only public profile and repository metadata. It cannot prove authorship, skill level or employment.</p></div></div>
+        {resumeGithubUrl && githubUrl === resumeGithubUrl && <small className="auto-detected"><Sparkles size={12} /> Link found in the resume — checked automatically.</small>}
+        <label className="field"><span>Candidate-provided GitHub profile</span><input value={githubUrl} onChange={(event) => setGithubUrl(event.target.value)} placeholder="https://github.com/username" /></label>
+        <button className="secondary-button" disabled={busy === 'github'} onClick={() => checkGitHub()}>{busy === 'github' ? 'Checking…' : 'Review public GitHub'}</button>
+        {!githubUrl && (searching ? <p className="search-status">Searching GitHub for “{candidate.name}”…</p> : searchResults && (searchResults.length ? <div className="github-search-results"><span>No link in the resume. Possible matches for “{candidate.name}” — confirm before using one:</span>{searchResults.map((profile) => <div className="github-search-row" key={profile.login}><img src={profile.avatarUrl} alt="" width={24} height={24} /><a href={profile.url} target="_blank" rel="noreferrer">@{profile.login} <ExternalLink size={11} /></a><button className="text-link" onClick={() => chooseGithubMatch(profile)}>Use this profile</button></div>)}</div> : <p className="search-status">No GitHub profiles found for “{candidate.name}”. Enter a profile URL if you have one.</p>))}
+        {searchError && <p className="search-status">{searchError}</p>}{renderResult(githubResult)}
+      </section>
+      <section className="provider-card">
+        <div><Link2 size={21} /><div><h3>LinkedIn official connection</h3><p>Candidate OAuth consent connects the account securely. Access tokens stay on the server and are never stored in the browser.</p></div></div>
+        <div className={`oauth-connect-panel ${linkedinOAuthStatus?.configured ? 'ready' : ''}`}>
+          <div><strong>{linkedinOAuthStatus?.configured ? 'OAuth ready' : 'Setup required'}</strong><p>{linkedinOAuthStatus?.message || 'Checking the LinkedIn agent service…'}</p></div>
+          <button className="secondary-button" disabled={!linkedinOAuthStatus?.configured || busy === 'linkedin-oauth'} onClick={connectLinkedIn}>{busy === 'linkedin-oauth' ? 'Connecting…' : linkedinResult?.status === 'identity-connected' ? 'Reconnect LinkedIn' : 'Connect LinkedIn'}</button>
+        </div>
+        {resumeLinkedinUrl && linkedinUrl === resumeLinkedinUrl && <small className="auto-detected"><Sparkles size={12} /> Link found in the resume. A link alone is not treated as verified evidence.</small>}
+        <label className="field"><span>Candidate-provided profile link <small>optional</small></span><span className="linked-field"><input value={linkedinUrl} onChange={(event) => setLinkedinUrl(event.target.value)} placeholder="https://www.linkedin.com/in/..." />{linkedinUrl && <a className="secondary-button" href={linkedinUrl} target="_blank" rel="noreferrer">Open <ExternalLink size={12} /></a>}</span></label>
+        {renderResult(linkedinResult)}
+        <div className="manual-evidence-divider"><span>Authorized evidence fallback</span></div>
+        <label className="field"><span>Candidate-authorized profile text</span><textarea rows={5} value={linkedinText} onChange={(event) => setLinkedinText(event.target.value)} placeholder="Paste experience or project text the candidate has authorized you to use…" /></label>
+        <button className="secondary-button" disabled={busy === 'linkedin' || !linkedinText.trim()} onClick={() => checkLinkedIn()}>{busy === 'linkedin' ? 'Comparing…' : 'Compare authorized text'}</button>
+        <p className="provider-boundary"><ShieldAlert size={14} /> Standard LinkedIn OpenID access does not expose employment history or skills. Those checks remain visibly unavailable unless LinkedIn approves additional products and scopes.</p>
+      </section>
+      {error && <div className="form-error"><AlertCircle size={16} />{error}</div>}
+      <div className="consent-note"><ShieldAlert size={18} /><p>Recruiter safeguard: never use protected characteristics, inferred identity, network connections, or private data in the fit assessment. These providers are evidence sources for human review—not automatic background checks.</p></div>
+    </div>
+    <div className="modal-footer"><button className="primary-button" onClick={onClose}>Done</button></div>
+  </Modal>
 }
 
 function AgentOperations({ screened, onOpen, onRun, busy }) {
@@ -473,7 +748,7 @@ function AgentOperations({ screened, onOpen, onRun, busy }) {
 
 export default function App() {
   const [view, setView] = useState('overview')
-  const [requisition, setRequisition] = useState(() => readStored(STORAGE.requisition, defaultRequisition))
+  const [requisition, setRequisition] = useState(() => ({ ...defaultRequisition, ...readStored(STORAGE.requisition, defaultRequisition) }))
   const [candidates, setCandidates] = useState(() => readStored(STORAGE.candidates, sampleCandidates))
   const [activeCandidateId, setActiveCandidateId] = useState(null)
   const [showUpload, setShowUpload] = useState(false)
@@ -486,6 +761,9 @@ export default function App() {
   const [verificationCandidate, setVerificationCandidate] = useState(null)
   const [agentBusy, setAgentBusy] = useState('')
   const [candidateFilter, setCandidateFilter] = useState('all')
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: 'auto' })
+  }, [view])
   const screened = useMemo(() => screenPool(candidates, requisition), [candidates, requisition])
   // Derived, not stored: always the current screened entry for this id, so a
   // live verification or agent-run update is reflected immediately instead of
@@ -494,6 +772,7 @@ export default function App() {
   const activeCandidate = activeCandidateId ? screened.find((c) => c.id === activeCandidateId) || null : null
   const insights = useMemo(() => getPoolInsights(screened, requisition), [screened, requisition])
   const requisitionAnalysis = useMemo(() => analyzeRequisition(screened, requisition), [screened, requisition])
+  useScrollReveal(`${view}:${screened.length}:${requisition.title}`)
   useEffect(() => { try { localStorage.setItem(STORAGE.candidates, JSON.stringify(candidates)) } catch { /* Keep the current in-memory session usable when storage is unavailable. */ } }, [candidates])
   useEffect(() => { try { localStorage.setItem(STORAGE.requisition, JSON.stringify(requisition)) } catch { /* Keep the current in-memory session usable when storage is unavailable. */ } }, [requisition])
   const selectCandidate = (id) => setSelected((current) => current.includes(id) ? current.filter((x) => x !== id) : current.length < 3 ? [...current, id] : current)
@@ -521,6 +800,24 @@ export default function App() {
   const saveVerification = (candidateId, update) => {
     setCandidates((current) => current.map((candidate) => candidate.id === candidateId ? { ...candidate, verification: { ...candidate.verification, ...update } } : candidate))
   }
+  const saveRequisition = (next) => {
+    const assessmentInputsChanged = JSON.stringify({ title: requisition.title, description: requisition.description, criteria: requisition.criteria }) !== JSON.stringify({ title: next.title, description: next.description, criteria: next.criteria })
+    setRequisition(next)
+    if (assessmentInputsChanged) {
+      setCandidates((current) => current.map((candidate) => ({
+        ...candidate,
+        agentReview: undefined,
+        verification: candidate.verification ? {
+          ...candidate.verification,
+          github: candidate.verification.github ? { ...candidate.verification.github, criteriaSignals: [] } : candidate.verification.github,
+          linkedin: candidate.verification.linkedin ? { ...candidate.verification.linkedin, criteriaSignals: [] } : candidate.verification.linkedin,
+        } : candidate.verification,
+      })))
+    }
+    setShowEdit(false)
+    setToast(assessmentInputsChanged ? 'Requisition saved, stale evidence mappings cleared, and pool rescored' : 'Requisition details saved')
+    setTimeout(() => setToast(''), 3500)
+  }
   const runAgent = async (candidate) => {
     setAgentBusy(candidate.id)
     try {
@@ -542,16 +839,17 @@ export default function App() {
   }
   return (
     <div className="app-shell">
+      <ScrollProgress />
       <Sidebar view={view} setView={setView} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} />
       {mobileOpen && <button className="mobile-overlay" onClick={() => setMobileOpen(false)} aria-label="Close navigation" />}
-      <main><Topbar view={view} openUpload={() => setShowUpload(true)} openHelp={() => setShowHelp(true)} onExport={exportReport} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} /><RequisitionHeader requisition={requisition} screened={screened} onEdit={() => setShowEdit(true)} onFilter={applyFilter} />
+      <main className="main-content"><Topbar view={view} requisitionId={requisition.id || defaultRequisition.id} openUpload={() => setShowUpload(true)} openHelp={() => setShowHelp(true)} onExport={exportReport} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} /><RequisitionHeader requisition={requisition} screened={screened} onEdit={() => setShowEdit(true)} onFilter={applyFilter} activeFilter={view === 'candidates' ? candidateFilter : 'all'} />
         {view === 'overview' && <Overview screened={screened} insights={insights} onOpen={(candidate) => setActiveCandidateId(candidate.id)} onNavigate={setView} onFilter={applyFilter} selected={selected} onSelect={selectCandidate} />}
         {view === 'candidates' && <Candidates screened={screened} onOpen={(candidate) => setActiveCandidateId(candidate.id)} selected={selected} onSelect={selectCandidate} filterMode={candidateFilter} clearFilter={() => setCandidateFilter('all')} />}
         {view === 'insights' && <Insights insights={insights} screened={screened} requisition={requisition} requisitionAnalysis={requisitionAnalysis} onOpen={(candidate) => setActiveCandidateId(candidate.id)} />}
         {view === 'agent' && <AgentOperations screened={screened} onOpen={(candidate) => setActiveCandidateId(candidate.id)} onRun={runAgent} busy={agentBusy} />}
       </main>
       {showUpload && <UploadModal onClose={() => setShowUpload(false)} onAdd={addCandidates} candidateCount={candidates.length} />}
-      {showEdit && <EditRequisition requisition={requisition} onClose={() => setShowEdit(false)} onSave={(next) => { setRequisition(next); setShowEdit(false); setToast('Requisition saved and applicant pool rescored'); setTimeout(() => setToast(''), 3500) }} />}
+      {showEdit && <EditRequisition requisition={requisition} onClose={() => setShowEdit(false)} onSave={saveRequisition} />}
       {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
       {activeCandidate && <CandidateDetail candidate={activeCandidate} requisition={requisition} onClose={() => setActiveCandidateId(null)} onRemove={() => removeCandidate(activeCandidate.id)} onVerify={() => setVerificationCandidate(activeCandidate)} onRunAgent={() => runAgent(activeCandidate)} />}
       {verificationCandidate && <VerificationModal candidate={verificationCandidate} requisition={requisition} onClose={() => setVerificationCandidate(null)} onSave={(update) => saveVerification(verificationCandidate.id, update)} />}
