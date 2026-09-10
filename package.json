@@ -7,6 +7,7 @@
     "dev": "vite",
     "dev:agent": "node server/index.js",
     "dev:full": "concurrently -k \"npm:dev:agent\" \"npm:dev\"",
+    "start": "node server/index.js",
     "build": "vite build",
     "test": "node --test",
     "preview": "vite preview",

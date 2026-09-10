@@ -1,6 +1,8 @@
 import 'dotenv/config'
 import cors from 'cors'
 import express from 'express'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { ZodError } from 'zod'
 import { createScreeningAgent } from '../agent/orchestrator.js'
 import { createRequirementIntelligenceAgent, requirementIntelligenceInputSchema } from '../agent/requirementIntelligence.js'
@@ -118,5 +120,17 @@ app.post('/api/verify/github/search', async (req, res) => {
   try { res.json({ results: await searchGitHubProfiles(req.body?.name) }) }
   catch (error) { res.status(502).json({ results: [], message: error.message || 'GitHub search unavailable.' }) }
 })
+
+// Render can run the API and the built Vite client as one web service. Keep
+// this opt-in so local development continues to use Vite's dev server.
+if (process.env.NODE_ENV === 'production') {
+  const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+  const clientDist = path.join(projectRoot, 'dist')
+  app.use(express.static(clientDist))
+  app.use((req, res, next) => {
+    if (req.method === 'GET' && !req.path.startsWith('/api/')) return res.sendFile(path.join(clientDist, 'index.html'))
+    return next()
+  })
+}
 
 export default app
